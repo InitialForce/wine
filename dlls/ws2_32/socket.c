@@ -2468,6 +2468,8 @@ static DWORD server_ioctl_sock( SOCKET s, DWORD code, LPVOID in_buff, DWORD in_s
  *              WSAIoctl                (WS2_32.50)
  *
  */
+static int server_setsockopt( SOCKET s, ULONG code, const char *optval, int optlen );
+
 INT WINAPI WSAIoctl(SOCKET s, DWORD code, LPVOID in_buff, DWORD in_size, LPVOID out_buff,
                     DWORD out_size, LPDWORD ret_size, LPWSAOVERLAPPED overlapped,
                     LPWSAOVERLAPPED_COMPLETION_ROUTINE completion )
@@ -2784,6 +2786,71 @@ INT WINAPI WSAIoctl(SOCKET s, DWORD code, LPVOID in_buff, DWORD in_size, LPVOID 
         DWORD ret;
 
         FIXME( "SIO_UDP_CONNRESET stub\n" );
+        ret = server_ioctl_sock( s, IOCTL_AFD_WINE_COMPLETE_ASYNC, &status, sizeof(status),
+                                 NULL, 0, ret_size, overlapped, completion );
+        SetLastError( ret );
+        return ret ? -1 : 0;
+    }
+
+    case SIO_ACQUIRE_PORT_RESERVATION:
+    {
+        /* Windows keeps a reserved port from other programs. Here the reservation only records
+         * the range; the port is taken when the socket binds, as without one. The call completes
+         * at once, and an overlapped caller is not signalled; MsQuic calls it synchronously. */
+        static LONG64 next_token;
+        const INET_PORT_RANGE *range = in_buff;
+        INET_PORT_RESERVATION_INSTANCE *instance = out_buff;
+
+        if (!socket_list_find( s ))
+        {
+            SetLastError( WSAENOTSOCK );
+            return -1;
+        }
+        if (!range || in_size < sizeof(*range) || !instance || out_size < sizeof(*instance))
+        {
+            SetLastError( WSAEINVAL );
+            return -1;
+        }
+        instance->Reservation.StartPort = range->StartPort;
+        instance->Reservation.NumberOfPorts = range->NumberOfPorts;
+        instance->Token.Token = InterlockedIncrement64( &next_token );
+        TRACE( "reserved port %u (%u ports) as token %s\n", ntohs( range->StartPort ),
+               range->NumberOfPorts, wine_dbgstr_longlong( instance->Token.Token ) );
+        if (ret_size) *ret_size = sizeof(*instance);
+        SetLastError( ERROR_SUCCESS );
+        return 0;
+    }
+
+    case SIO_ASSOCIATE_PORT_RESERVATION:
+    {
+        /* Every socket associated with one reservation may bind its port, as MsQuic's
+         * per-processor sockets do. SO_REUSEADDR gives the same sharing on the host, but unlike a
+         * Windows reservation it does not keep out another program that also sets it. */
+        DWORD value = 1;
+
+        if (!in_buff || in_size < sizeof(ULONG64))
+        {
+            SetLastError( WSAEINVAL );
+            return -1;
+        }
+        TRACE( "associated with token %s\n", wine_dbgstr_longlong( *(ULONG64 *)in_buff ) );
+        if (ret_size) *ret_size = 0;
+        return server_setsockopt( s, IOCTL_AFD_WINE_SET_SO_REUSEADDR, (char *)&value, sizeof(value) );
+    }
+
+    case SIO_CPU_AFFINITY:
+    {
+        NTSTATUS status = STATUS_SUCCESS;
+        DWORD ret;
+
+        /* On Windows this steers a socket's receive processing to one CPU. Linux spreads UDP
+         * receive itself, so accepting the hint changes nothing. MsQuic fails to listen without it. */
+        if (!in_buff || in_size < sizeof(USHORT))
+        {
+            SetLastError( WSAEFAULT );
+            return -1;
+        }
+        TRACE( "SIO_CPU_AFFINITY %u ignored\n", *(USHORT *)in_buff );
         ret = server_ioctl_sock( s, IOCTL_AFD_WINE_COMPLETE_ASYNC, &status, sizeof(status),
                                  NULL, 0, ret_size, overlapped, completion );
         SetLastError( ret );
@@ -3663,6 +3730,19 @@ int WINAPI setsockopt( SOCKET s, int level, int optname, const char *optval, int
         case IP_UNICAST_IF:
             return server_setsockopt( s, IOCTL_AFD_WINE_SET_IP_UNICAST_IF, optval, optlen );
 
+        /* Asks for the ECN bits of received packets in a control message. Accepted but not
+         * delivered: the caller sees no ECN marks, as on a path that clears them. MsQuic fails
+         * to listen when the option is refused. */
+        case IP_ECN:
+            if (!optval || optlen < sizeof(DWORD))
+            {
+                SetLastError( WSAEFAULT );
+                return -1;
+            }
+            TRACE( "IP_ECN ignored\n" );
+            SetLastError( ERROR_SUCCESS );
+            return 0;
+
         default:
             FIXME("Unknown IPPROTO_IP optname 0x%08x\n", optname);
             SetLastError(WSAENOPROTOOPT);
@@ -3764,6 +3844,17 @@ int WINAPI setsockopt( SOCKET s, int level, int optname, const char *optval, int
             }
             value = *optval;
             return server_setsockopt( s, IOCTL_AFD_WINE_SET_IPV6_V6ONLY, (char *)&value, sizeof(value) );
+
+        /* See IP_ECN. */
+        case IPV6_ECN:
+            if (!optval || optlen < sizeof(DWORD))
+            {
+                SetLastError( WSAEFAULT );
+                return -1;
+            }
+            TRACE( "IPV6_ECN ignored\n" );
+            SetLastError( ERROR_SUCCESS );
+            return 0;
 
         default:
             FIXME("Unknown IPPROTO_IPV6 optname 0x%08x\n", optname);
