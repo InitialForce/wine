@@ -159,6 +159,8 @@ struct filter_graph
     /* Respectively: the last timestamp at which we started streaming, and the
      * current offset within the stream. */
     REFERENCE_TIME stream_start, stream_elapsed;
+    /* The start time most recently passed to IBaseFilter::Run(). */
+    REFERENCE_TIME filter_start;
     REFERENCE_TIME stream_stop;
     LONGLONG current_pos;
 
@@ -1822,6 +1824,8 @@ static HRESULT graph_start(struct filter_graph *graph, REFERENCE_TIME stream_sta
          * initialize. */
         stream_start += 200 * 10000;
     }
+
+    graph->filter_start = stream_start;
 
     if (SUCCEEDED(IMediaSeeking_GetStopPosition(&graph->IMediaSeeking_iface, &stream_stop)))
         graph->stream_stop = stream_stop;
@@ -5821,11 +5825,22 @@ static HRESULT WINAPI GraphConfig_RemoveFilterFromCache(IGraphConfig *iface, IBa
 
 static HRESULT WINAPI GraphConfig_GetStartTime(IGraphConfig *iface, REFERENCE_TIME *prtStart)
 {
-    struct filter_graph *This = impl_from_IGraphConfig(iface);
+    struct filter_graph *graph = impl_from_IGraphConfig(iface);
+    HRESULT hr = S_OK;
 
-    FIXME("(%p)->(%p): stub!\n", This, prtStart);
+    TRACE("graph %p, start %p.\n", graph, prtStart);
 
-    return E_NOTIMPL;
+    if (!prtStart)
+        return E_POINTER;
+
+    EnterCriticalSection(&graph->cs);
+    if (graph->state == State_Running)
+        *prtStart = graph->filter_start;
+    else
+        hr = VFW_E_WRONG_STATE;
+    LeaveCriticalSection(&graph->cs);
+
+    return hr;
 }
 
 static HRESULT WINAPI GraphConfig_PushThroughData(IGraphConfig *iface, IPin *pOutputPin,
