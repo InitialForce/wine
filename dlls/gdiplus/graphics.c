@@ -1217,6 +1217,55 @@ static ARGB resample_bitmap_pixel(GDIPCONST GpRect *src_rect, LPBYTE bits, UINT 
     }
 }
 
+/* Averages the source pixels under one destination pixel: the prefilter the high-quality
+ * interpolation modes apply when an image is drawn smaller. The area runs from (x0, y0) to
+ * (x1, y1) in source pixels, where pixel i covers [i, i+1), and a pixel the area covers only
+ * partly counts by the covered fraction. Colors are weighted by alpha, so transparent pixels
+ * do not darken the result.
+ *
+ * The area is cut to src_rect, the pixels locked for the draw, so a destination pixel on the
+ * edge averages only the image pixels it covers. Native gdiplus blends in the outside color
+ * there instead, which gives the semi-transparent border it is known for. */
+static ARGB resample_bitmap_area(GDIPCONST GpRect *src_rect, LPBYTE bits, UINT width,
+    UINT height, REAL x0, REAL y0, REAL x1, REAL y1, GDIPCONST GpImageAttributes *attributes)
+{
+    INT ix, iy, ix0, iy0, ix1, iy1;
+    REAL a = 0.0, r = 0.0, g = 0.0, b = 0.0, total = 0.0;
+
+    x0 = max(x0, (REAL)src_rect->X);
+    y0 = max(y0, (REAL)src_rect->Y);
+    x1 = min(x1, (REAL)(src_rect->X + src_rect->Width));
+    y1 = min(y1, (REAL)(src_rect->Y + src_rect->Height));
+    ix0 = floorf(x0);
+    iy0 = floorf(y0);
+    ix1 = ceilf(x1);
+    iy1 = ceilf(y1);
+
+    for (iy = iy0; iy < iy1; iy++)
+    {
+        REAL wy = min(y1, (REAL)(iy + 1)) - max(y0, (REAL)iy);
+
+        for (ix = ix0; ix < ix1; ix++)
+        {
+            REAL w = wy * (min(x1, (REAL)(ix + 1)) - max(x0, (REAL)ix));
+            ARGB color = sample_bitmap_pixel(src_rect, bits, width, height, ix, iy, attributes);
+            REAL wa = (color >> 24) * w;
+
+            a += wa;
+            r += ((color >> 16) & 0xff) * wa;
+            g += ((color >> 8) & 0xff) * wa;
+            b += (color & 0xff) * wa;
+            total += w;
+        }
+    }
+
+    if (total <= 0.0 || a <= 0.0)
+        return 0;
+
+    return ((ARGB)(a / total + 0.5f) << 24) | ((ARGB)(r / a + 0.5f) << 16) |
+           ((ARGB)(g / a + 0.5f) << 8) | (ARGB)(b / a + 0.5f);
+}
+
 static REAL intersect_line_scanline(const GpPointF *p1, const GpPointF *p2, REAL y)
 {
     return (p1->X - p2->X) * (p2->Y - y) / (p2->Y - p1->Y) + p2->X;
@@ -3391,6 +3440,8 @@ GpStatus WINGDIPAPI GdipDrawImagePointsRect(GpGraphics *graphics, GpImage *image
                 GpMatrix dst_to_src;
                 REAL m11, m12, m21, m22, mdx, mdy;
                 REAL x_dx, x_dy, y_dx, y_dy;
+                REAL footprint_x, footprint_y, center_dx, center_dy;
+                BOOL prefilter;
                 ARGB *dst_color;
                 GpPointF src_pointf_row, src_pointf;
 
@@ -3415,6 +3466,32 @@ GpStatus WINGDIPAPI GdipDrawImagePointsRect(GpGraphics *graphics, GpImage *image
                 x_dy = dst_to_src.matrix[1];
                 y_dx = dst_to_src.matrix[2];
                 y_dy = dst_to_src.matrix[3];
+
+                /* The source extent of one destination pixel. When it is more than one source
+                 * pixel, the high-quality modes average that extent, as native gdiplus does;
+                 * sampling one point there skips most of the source pixels. */
+                footprint_x = fabsf(x_dx) + fabsf(y_dx);
+                footprint_y = fabsf(x_dy) + fabsf(y_dy);
+                prefilter = (interpolation == InterpolationModeHighQualityBilinear ||
+                             interpolation == InterpolationModeHighQualityBicubic) &&
+                            (footprint_x > 1.0f || footprint_y > 1.0f);
+                footprint_x = max(footprint_x, 1.0f);
+                footprint_y = max(footprint_y, 1.0f);
+
+                /* From src_pointf to the centre of the destination pixel, in source pixels where
+                 * pixel i covers [i, i+1). With PixelOffsetModeHalf and HighQuality a destination
+                 * pixel covers [x, x+1), so its centre is half a pixel on; with the other modes it
+                 * covers [x-0.5, x+0.5), and the source pixels are shifted the same way. */
+                if (offset_mode == PixelOffsetModeHalf || offset_mode == PixelOffsetModeHighQuality)
+                {
+                    center_dx = 0.5f * (x_dx + y_dx);
+                    center_dy = 0.5f * (x_dy + y_dy);
+                }
+                else
+                {
+                    center_dx = 0.5f;
+                    center_dy = 0.5f;
+                }
 
                 /* Transform the bits as needed to the destination. */
                 dst_width = dst_area.right - dst_area.left;
@@ -3448,8 +3525,18 @@ GpStatus WINGDIPAPI GdipDrawImagePointsRect(GpGraphics *graphics, GpImage *image
                     {
                         if (src_pointf.X >= srcx && src_pointf.X < srcx + srcwidth &&
                             src_pointf.Y >= srcy && src_pointf.Y < srcy + srcheight)
-                            *dst_color = resample_bitmap_pixel(&src_area, src_data, bitmap->width, bitmap->height, &src_pointf,
-                                                               imageAttributes, interpolation, offset_mode);
+                        {
+                            REAL cx = src_pointf.X + center_dx, cy = src_pointf.Y + center_dy;
+
+                            if (prefilter)
+                                *dst_color = resample_bitmap_area(&src_area, src_data, bitmap->width, bitmap->height,
+                                                                  cx - footprint_x / 2, cy - footprint_y / 2,
+                                                                  cx + footprint_x / 2, cy + footprint_y / 2,
+                                                                  imageAttributes);
+                            else
+                                *dst_color = resample_bitmap_pixel(&src_area, src_data, bitmap->width, bitmap->height, &src_pointf,
+                                                                   imageAttributes, interpolation, offset_mode);
+                        }
                         dst_color++;
                     }
                 }
