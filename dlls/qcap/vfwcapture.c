@@ -48,6 +48,8 @@ struct vfw_capture
     CRITICAL_SECTION state_cs;
 
     HANDLE thread;
+    /* Reference time the stream was started at, protected by state_cs. */
+    REFERENCE_TIME stream_start;
 };
 
 static inline struct vfw_capture *impl_from_strmbase_filter(struct strmbase_filter *iface)
@@ -180,6 +182,30 @@ static DWORD WINAPI stream_thread(void *arg)
             break;
         }
 
+        if (filter->filter.clock)
+        {
+            const VIDEOINFOHEADER *format = (const VIDEOINFOHEADER *)filter->source.pin.mt.pbFormat;
+            REFERENCE_TIME now, start, end;
+
+            /* Stamp the sample with the stream time it was captured at, as
+             * native capture filters do. */
+            IReferenceClock_GetTime(filter->filter.clock, &now);
+            EnterCriticalSection(&filter->state_cs);
+            start = now - filter->stream_start;
+            LeaveCriticalSection(&filter->state_cs);
+
+            /* The graph starts the stream slightly in the future; frames read
+             * before then belong to no stream time yet. */
+            if (start < 0)
+            {
+                IMediaSample_Release(sample);
+                continue;
+            }
+
+            end = start + (format->AvgTimePerFrame > 0 ? format->AvgTimePerFrame : 1);
+            IMediaSample_SetTime(sample, &start, &end);
+        }
+
         hr = IMemInputPin_Receive(filter->source.pMemInputPin, sample);
         IMediaSample_Release(sample);
         if (FAILED(hr))
@@ -229,6 +255,7 @@ static HRESULT vfw_capture_start_stream(struct strmbase_filter *iface, REFERENCE
     }
 
     EnterCriticalSection(&filter->state_cs);
+    filter->stream_start = time;
     filter->state = State_Running;
     LeaveCriticalSection(&filter->state_cs);
     WakeConditionVariable(&filter->state_cv);
