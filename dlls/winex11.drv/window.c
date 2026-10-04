@@ -1243,12 +1243,20 @@ static void set_wm_hints( struct x11drv_win_data *data )
 Window init_clip_window(void)
 {
     struct x11drv_thread_data *data = x11drv_init_thread_data();
+    XSetWindowAttributes attr;
 
-    if (!data->clip_window &&
-        (data->clip_window = (Window)NtUserGetProp( NtUserGetDesktopWindow(), clip_window_prop )))
-    {
-        XSelectInput( data->display, data->clip_window, StructureNotifyMask );
-    }
+    if (data->clip_window) return data->clip_window;
+
+    /* Each thread creates its own clipping window on its own display connection, rather than
+     * using the desktop's. The desktop's window id is only valid while the desktop process
+     * keeps its connection open, and only on the X server that process connected to. A thread
+     * that maps, grabs or unmaps a stale id gets an X error that ends the process, or acts on
+     * an unrelated window that was given the same id. */
+    attr.override_redirect = TRUE;
+    attr.event_mask = StructureNotifyMask | FocusChangeMask;
+    data->clip_window = XCreateWindow( data->display, root_window, 0, 0, 1, 1, 0, 0,
+                                       InputOnly, default_visual.visual,
+                                       CWOverrideRedirect | CWEventMask, &attr );
     return data->clip_window;
 }
 
