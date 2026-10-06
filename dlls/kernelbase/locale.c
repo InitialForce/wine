@@ -6116,12 +6116,47 @@ struct custom_locale
 {
     WCHAR name[LOCALE_NAME_MAX_LENGTH];
     WCHAR parent[LOCALE_NAME_MAX_LENGTH];
-    WCHAR lang[4];
+    WCHAR lang[LOCALE_NAME_MAX_LENGTH];
+    WCHAR iso639[4];
     WCHAR script[5];
     WCHAR region[4];
     const NLS_LOCALE_DATA *base;
     LCID base_lcid;
+    BOOL base_language;   /* the base locale knows the language */
+    BOOL base_region;     /* the base locale is in the requested region */
+    GEOID geoid;
+    const struct geo_id *geo;   /* the requested region */
 };
+
+/* Fill in where the data of a custom locale comes from. Windows takes the formats from the
+ * closest known locale. When that locale is not in the requested region, the currency, the
+ * dialling code and the geo id come from the region, and the other regional values are
+ * generic. */
+static BOOL set_custom_locale_base( struct custom_locale *cl, WCHAR *core )
+{
+    const WCHAR *base_region;
+    LCID lcid;
+
+    while (core[0])
+    {
+        WCHAR *last;
+        if ((cl->base = get_locale_by_name( core, &lcid ))) break;
+        if (!(last = wcsrchr( core, '-' ))) break;
+        *last = 0;
+    }
+    if (cl->base) cl->base_language = TRUE;
+    else cl->base = get_locale_by_name( LOCALE_NAME_INVARIANT, &lcid );
+    if (!cl->base) return FALSE;
+    cl->base_lcid = lcid;
+
+    base_region = locale_strings + cl->base->siso3166ctryname + 1;
+    cl->base_region = cl->base_language && cl->region[0] && !wcsicmp( base_region, cl->region );
+    if (cl->base_region) cl->geoid = cl->base->igeoid;
+    else if (!cl->region[0]) cl->geoid = 244;  /* United States, as on Windows */
+    else if ((cl->geo = find_geo_name_entry( cl->region ))) cl->geoid = cl->geo->id;
+    else cl->geoid = 39070;  /* World */
+    return TRUE;
+}
 
 static BOOL is_ascii_alpha( WCHAR ch )
 {
@@ -6143,98 +6178,112 @@ static WCHAR ascii_upper( WCHAR ch )
     return (ch >= 'a' && ch <= 'z') ? ch - 'a' + 'A' : ch;
 }
 
-/* Parse language[-Script][-REGION[-variant...]][-singleton-extension...], with '-' or '_'
- * between subtags. The language is 2 or 3 letters, the script 4 letters, the region 2 letters
- * or 3 digits, and each variant or extension subtag 1 to 8 letters or digits. As on Windows,
- * a variant needs a region. */
+static BOOL is_all( const WCHAR *str, int len, BOOL (*func)(WCHAR) )
+{
+    while (len--) if (!func( *str++ )) return FALSE;
+    return TRUE;
+}
+
+/* The rules below are what Windows 10 accepts, measured name by name. Subtags are separated
+ * by '-' or '_' and are 1 to 8 letters or digits.
+ * - A name that starts with a single letter ("x-foo", "i-klingon") needs at least one more
+ *   subtag. It keeps its case, its language is "und" and it has no parent.
+ * - Otherwise the name is a language of 2 or 3 letters, an optional 4-letter script and an
+ *   optional region of 2 letters or 3 digits. After a region any subtags may follow. Without
+ *   a region only an extension may follow: a single-character subtag and at least one more.
+ * The language is lower case, the script title case, the region upper case and every later
+ * subtag lower case. The parent drops everything from the first single-character subtag after
+ * the language, or else the last subtag. */
 static BOOL parse_custom_locale( const WCHAR *name, struct custom_locale *cl )
 {
-    const WCHAR *p = name, *start;
+    const WCHAR *subtags[LOCALE_NAME_MAX_LENGTH];
+    int lens[LOCALE_NAME_MAX_LENGTH];
     WCHAR core[LOCALE_NAME_MAX_LENGTH];
-    LCID lcid;
-    int i, n, part = 0, pos = 0, core_len = 0;
-    BOOL ext = FALSE;
+    const WCHAR *p = name;
+    int i, j, count = 0, pos = 0, next, parent_len = -1;
+    BOOL private_use;
 
     memset( cl, 0, sizeof(*cl) );
     if (!name || !name[0] || name == LOCALE_NAME_USER_DEFAULT || name[0] == '!') return FALSE;
+    if (wcslen( name ) >= LOCALE_NAME_MAX_LENGTH) return FALSE;
 
     for (;;)
     {
-        start = p;
+        subtags[count] = p;
         while (is_ascii_alpha( *p ) || is_ascii_digit( *p )) p++;
-        n = p - start;
-        if (n < 1 || n > 8 || (*p && *p != '-' && *p != '_')) return FALSE;
-        if (pos + n + 1 >= LOCALE_NAME_MAX_LENGTH) return FALSE;
-        if (pos) cl->name[pos++] = '-';
-
-        if (ext)
-        {
-            for (i = 0; i < n; i++) cl->name[pos++] = ascii_lower( start[i] );
-        }
-        else if (part == 0)
-        {
-            if (n < 2 || n > 3) return FALSE;
-            for (i = 0; i < n; i++)
-            {
-                if (!is_ascii_alpha( start[i] )) return FALSE;
-                cl->lang[i] = cl->name[pos++] = ascii_lower( start[i] );
-            }
-            part = 1;
-        }
-        else if (part == 1 && n == 4 && is_ascii_alpha( start[0] ) && is_ascii_alpha( start[1] ) &&
-                 is_ascii_alpha( start[2] ) && is_ascii_alpha( start[3] ))
-        {
-            for (i = 0; i < n; i++)
-                cl->script[i] = cl->name[pos++] = i ? ascii_lower( start[i] ) : ascii_upper( start[i] );
-            part = 2;
-        }
-        else if (part <= 2 && ((n == 2 && is_ascii_alpha( start[0] ) && is_ascii_alpha( start[1] )) ||
-                               (n == 3 && is_ascii_digit( start[0] ) && is_ascii_digit( start[1] ) &&
-                                is_ascii_digit( start[2] ))))
-        {
-            for (i = 0; i < n; i++) cl->region[i] = cl->name[pos++] = ascii_upper( start[i] );
-            part = 3;
-        }
-        else if (n == 1)
-        {
-            core_len = pos - 1;
-            cl->name[pos++] = ascii_lower( start[0] );
-            ext = TRUE;
-        }
-        else if (part == 3)
-        {
-            for (i = 0; i < n; i++) cl->name[pos++] = ascii_lower( start[i] );
-        }
-        else return FALSE;
-
+        lens[count] = p - subtags[count];
+        if (lens[count] < 1 || lens[count] > 8) return FALSE;
+        count++;
         if (!*p) break;
+        if (*p != '-' && *p != '_') return FALSE;
         p++;
     }
-    if (!ext) core_len = pos;
-    cl->name[pos] = 0;
-    memcpy( core, cl->name, core_len * sizeof(WCHAR) );
-    core[core_len] = 0;
 
-    /* the parent drops the extensions, or else the last subtag */
-    lstrcpynW( cl->parent, core, ARRAY_SIZE(cl->parent) );
-    if (!ext)
+    private_use = lens[0] == 1;
+    if (private_use)
     {
-        WCHAR *last = wcsrchr( cl->parent, '-' );
-        if (last) *last = 0;
-        else cl->parent[0] = 0;
+        if (count < 2 || !is_ascii_alpha( subtags[0][0] )) return FALSE;
+        for (i = 0; i < count; i++)
+        {
+            if (i) cl->name[pos++] = '-';
+            memcpy( cl->name + pos, subtags[i], lens[i] * sizeof(WCHAR) );
+            pos += lens[i];
+        }
+        cl->name[pos] = 0;
+        wcscpy( cl->lang, cl->name );
+        wcscpy( cl->iso639, L"und" );
+        core[0] = 0;
+        return set_custom_locale_base( cl, core );
     }
 
-    /* take the data of the closest known locale */
-    for (;;)
+    if (lens[0] > 3 || !is_all( subtags[0], lens[0], is_ascii_alpha )) return FALSE;
+    for (j = 0; j < lens[0]; j++) cl->name[pos++] = cl->iso639[j] = ascii_lower( subtags[0][j] );
+    next = 1;
+
+    if (next < count && lens[next] == 4 && is_all( subtags[next], 4, is_ascii_alpha ))
+    {
+        cl->name[pos++] = '-';
+        for (j = 0; j < 4; j++)
+            cl->name[pos++] = cl->script[j] = j ? ascii_lower( subtags[next][j] ) : ascii_upper( subtags[next][j] );
+        next++;
+    }
+    if (next < count && ((lens[next] == 2 && is_all( subtags[next], 2, is_ascii_alpha )) ||
+                         (lens[next] == 3 && is_all( subtags[next], 3, is_ascii_digit ))))
+    {
+        cl->name[pos++] = '-';
+        for (j = 0; j < lens[next]; j++) cl->name[pos++] = cl->region[j] = ascii_upper( subtags[next][j] );
+        next++;
+    }
+    else if (next < count && (lens[next] != 1 || next + 1 >= count)) return FALSE;
+
+    for (i = next; i < count; i++)
+    {
+        if (lens[i] == 1 && parent_len < 0) parent_len = pos;
+        cl->name[pos++] = '-';
+        for (j = 0; j < lens[i]; j++) cl->name[pos++] = ascii_lower( subtags[i][j] );
+    }
+    cl->name[pos] = 0;
+
+    if (parent_len < 0)
     {
         WCHAR *last;
-        if ((cl->base = get_locale_by_name( core, &lcid ))) break;
-        if (!(last = wcsrchr( core, '-' ))) break;
-        *last = 0;
+        wcscpy( cl->parent, cl->name );
+        if ((last = wcsrchr( cl->parent, '-' ))) *last = 0;
+        else cl->parent[0] = 0;
+        parent_len = pos;
     }
-    if (!cl->base) cl->base = get_locale_by_name( LOCALE_NAME_INVARIANT, &lcid );
-    cl->base_lcid = lcid;
-    return cl->base != NULL;
+    else
+    {
+        memcpy( cl->parent, cl->name, parent_len * sizeof(WCHAR) );
+        cl->parent[parent_len] = 0;
+    }
+
+    /* the language name is the whole name without a region, or else the parent */
+    wcscpy( cl->lang, cl->region[0] ? cl->parent : cl->name );
+
+    memcpy( core, cl->name, parent_len * sizeof(WCHAR) );
+    core[parent_len] = 0;
+    return set_custom_locale_base( cl, core );
 }
 
 static int custom_locale_return_string( const WCHAR *format, const WCHAR *arg, LCTYPE type,
@@ -6258,7 +6307,7 @@ static int get_custom_locale_info( const struct custom_locale *cl, LCTYPE type, 
     case LOCALE_SPARENT:
         return custom_locale_return_string( L"%s", cl->parent, type, buffer, len );
     case LOCALE_SISO639LANGNAME:
-        return custom_locale_return_string( L"%s", cl->lang, type, buffer, len );
+        return custom_locale_return_string( L"%s", cl->iso639, type, buffer, len );
     case LOCALE_SISO3166CTRYNAME:
         return custom_locale_return_string( L"%s", cl->region[0] ? cl->region : L"ZZ", type, buffer, len );
     case LOCALE_SSCRIPTS:
@@ -6274,8 +6323,42 @@ static int get_custom_locale_info( const struct custom_locale *cl, LCTYPE type, 
     case LOCALE_SLOCALIZEDCOUNTRYNAME:
     case LOCALE_SENGLISHCOUNTRYNAME:
     case LOCALE_SNATIVECOUNTRYNAME:
-        return custom_locale_return_string( L"Unknown Region (%s)", cl->region[0] ? cl->region : L"ZZ",
-                                            type, buffer, len );
+        /* Windows returns "Unknown Region (" when the name has no region */
+        if (!cl->region[0]) return custom_locale_return_string( L"%s", L"Unknown Region (", type, buffer, len );
+        return custom_locale_return_string( L"Unknown Region (%s)", cl->region, type, buffer, len );
+    case LOCALE_IGEOID:
+        return locale_return_number( cl->geoid, type, buffer, len );
+    case LOCALE_SABBREVLANGNAME:
+        if (cl->base_language) break;
+        return custom_locale_return_string( L"%s", L"ZZZ", type, buffer, len );
+    case LOCALE_SISO639LANGNAME2:
+        if (cl->base_language) break;
+        return custom_locale_return_string( L"%s", cl->iso639, type, buffer, len );
+    }
+
+    if (!cl->base_region)
+    {
+        switch (LOWORD(type))
+        {
+        case LOCALE_SCURRENCY:
+            return custom_locale_return_string( L"%s", cl->geo && cl->geo->currsymbol[0] ? cl->geo->currsymbol : L"\x00a4",
+                                                type, buffer, len );
+        case LOCALE_SINTLSYMBOL:
+            return custom_locale_return_string( L"%s", cl->geo && cl->geo->currcode[0] ? cl->geo->currcode : L"XDR",
+                                                type, buffer, len );
+        case LOCALE_ICOUNTRY:
+            return locale_return_number( cl->geo && cl->geo->dialcode ? cl->geo->dialcode : 1, type, buffer, len );
+        case LOCALE_SENGCURRNAME:
+        case LOCALE_SNATIVECURRNAME:
+            return custom_locale_return_string( L"%s", L"International Monetary Fund", type, buffer, len );
+        case LOCALE_SABBREVCTRYNAME:
+        case LOCALE_SISO3166CTRYNAME2:
+            return custom_locale_return_string( L"%s", L"ZZZ", type, buffer, len );
+        case LOCALE_IMEASURE:
+            return locale_return_number( 0, type, buffer, len );
+        case LOCALE_IPAPERSIZE:
+            return locale_return_number( 9, type, buffer, len );
+        }
     }
     return get_locale_info( cl->base, cl->base_lcid, type | LOCALE_NOUSEROVERRIDE, buffer, len );
 }
