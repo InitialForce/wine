@@ -305,6 +305,7 @@ static void test_CoreApplication(void)
     check_interface( factory, &IID_IInspectable, TRUE );
     check_interface( factory, &IID_IAgileObject, TRUE );
     check_interface( factory, &IID_IActivationFactory, TRUE );
+    check_interface( factory, &IID_ICoreApplication, TRUE );
 
     ref = IActivationFactory_Release( factory );
     ok( ref == 1, "got ref %ld.\n", ref );
