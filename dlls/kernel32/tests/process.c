@@ -1539,6 +1539,105 @@ static  void    test_SuspendFlag(void)
     DeleteFileA(resfile);
 }
 
+static LONG times_stop, times_checked, times_bad;
+static ULONGLONG times_bad_value;
+
+static ULONGLONG filetime_to_ull(const FILETIME *ft)
+{
+    return ((ULONGLONG)ft->dwHighDateTime << 32) | ft->dwLowDateTime;
+}
+
+/* Reads the creation time of every process until told to stop, and counts the ones that
+ * are more than a second in the future. */
+static DWORD WINAPI process_times_thread(void *arg)
+{
+    FILETIME create, exit_time, kernel, user, now;
+    PROCESSENTRY32 entry;
+    HANDLE snapshot, process;
+
+    while (!times_stop)
+    {
+        snapshot = pCreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snapshot == INVALID_HANDLE_VALUE) continue;
+        entry.dwSize = sizeof(entry);
+        if (Process32First(snapshot, &entry)) do
+        {
+            if (!(process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID)))
+                continue;
+            if (GetProcessTimes(process, &create, &exit_time, &kernel, &user))
+            {
+                GetSystemTimeAsFileTime(&now);
+                InterlockedIncrement(&times_checked);
+                if (filetime_to_ull(&create) > filetime_to_ull(&now) + 10000000)
+                {
+                    times_bad_value = filetime_to_ull(&create);
+                    InterlockedIncrement(&times_bad);
+                }
+            }
+            CloseHandle(process);
+        } while (Process32Next(snapshot, &entry));
+        CloseHandle(snapshot);
+    }
+    return 0;
+}
+
+static void test_ProcessTimes(void)
+{
+    char buffer[MAX_PATH + 16];
+    PROCESS_INFORMATION info;
+    STARTUPINFOA startup;
+    FILETIME before, after, create, create2, exit_time, kernel, user;
+    HANDLE thread;
+    DWORD ret;
+    int i;
+
+    memset(&startup, 0, sizeof(startup));
+    startup.cb = sizeof(startup);
+    sprintf(buffer, "\"%s\" process exit", selfname);
+
+    GetSystemTimeAsFileTime(&before);
+    ok(CreateProcessA(NULL, buffer, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &startup, &info),
+       "CreateProcess failed, error %lu\n", GetLastError());
+    ok(GetProcessTimes(info.hProcess, &create, &exit_time, &kernel, &user),
+       "GetProcessTimes failed, error %lu\n", GetLastError());
+    GetSystemTimeAsFileTime(&after);
+    /* allow for the coarser clock of GetSystemTimeAsFileTime */
+    ok(filetime_to_ull(&create) + 160000 >= filetime_to_ull(&before)
+       && filetime_to_ull(&create) <= filetime_to_ull(&after) + 160000,
+       "creation time %s is not between %s and %s\n", wine_dbgstr_longlong(filetime_to_ull(&create)),
+       wine_dbgstr_longlong(filetime_to_ull(&before)), wine_dbgstr_longlong(filetime_to_ull(&after)));
+
+    ResumeThread(info.hThread);
+    ret = WaitForSingleObject(info.hProcess, 30000);
+    ok(ret == WAIT_OBJECT_0, "WaitForSingleObject returned %lu\n", ret);
+
+    /* It does not change once the process has finished loading. */
+    ok(GetProcessTimes(info.hProcess, &create2, &exit_time, &kernel, &user),
+       "GetProcessTimes failed, error %lu\n", GetLastError());
+    ok(filetime_to_ull(&create2) == filetime_to_ull(&create), "creation time changed from %s to %s\n",
+       wine_dbgstr_longlong(filetime_to_ull(&create)), wine_dbgstr_longlong(filetime_to_ull(&create2)));
+    CloseHandle(info.hThread);
+    CloseHandle(info.hProcess);
+
+    /* Another process can read the creation time while a new process is still loading. */
+    times_stop = times_checked = times_bad = 0;
+    thread = CreateThread(NULL, 0, process_times_thread, NULL, 0, NULL);
+    for (i = 0; i < 10; i++)
+    {
+        ok(CreateProcessA(NULL, buffer, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &info),
+           "CreateProcess failed, error %lu\n", GetLastError());
+        WaitForSingleObject(info.hProcess, 30000);
+        CloseHandle(info.hThread);
+        CloseHandle(info.hProcess);
+    }
+    times_stop = 1;
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+    ok(times_checked > 0, "no creation time was read\n");
+    ok(!times_bad, "%ld of %ld creation times were in the future, for example %s\n", times_bad,
+       times_checked, wine_dbgstr_longlong(times_bad_value));
+}
+
 static  void    test_DebuggingFlag(void)
 {
     char                buffer[2 * MAX_PATH + 25];
@@ -5810,6 +5909,7 @@ START_TEST(process)
     test_Toolhelp();
     test_Environment();
     test_SuspendFlag();
+    test_ProcessTimes();
     test_DebuggingFlag();
     test_Console();
     test_ExitCode();

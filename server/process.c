@@ -649,6 +649,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     list_init( &process->classes );
     list_init( &process->views );
 
+    process->start_time = current_time;
     process->end_time = 0;
 
     if (sd && !default_set_sd( &process->obj, sd, OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
@@ -1430,8 +1431,6 @@ DECL_HANDLER(init_process_done)
 
     current->teb = req->teb;
     process->peb = req->peb;
-
-    process->start_time = current_time;
 
     init_process_tracing( process );
     generate_startup_debug_events( process );
