@@ -626,6 +626,7 @@ typedef struct _RpcServerProtseq_np
 {
     RpcServerProtseq common;
     HANDLE mgr_event;
+    HANDLE wake_event;
 } RpcServerProtseq_np;
 
 static RpcServerProtseq *rpcrt4_protseq_np_alloc(void)
@@ -710,6 +711,77 @@ static void rpcrt4_protseq_np_free_wait_array(RpcServerProtseq *protseq, void *a
     free(array);
 }
 
+static void CALLBACK np_listener_signaled(void *wake_event, BOOLEAN timed_out)
+{
+    SetEvent(wake_event);
+}
+
+/* Waits until one of the count handles in objs is signaled and returns its WAIT_OBJECT_0 index,
+ * WAIT_FAILED, or WAIT_TIMEOUT when the caller should build the array again. There is one
+ * listener per endpoint, and COM registers an endpoint for every apartment that ever waits, so
+ * a process that has made many STA threads has more listeners than WaitForMultipleObjectsEx()
+ * takes. The handles past that limit are waited for on thread pool waits, which wake this
+ * thread through wake_event. */
+static DWORD np_wait_for_listeners(RpcServerProtseq *protseq, unsigned int count, HANDLE *objs)
+{
+    RpcServerProtseq_np *npps = CONTAINING_RECORD(protseq, RpcServerProtseq_np, common);
+    const unsigned int direct = MAXIMUM_WAIT_OBJECTS - 1;
+    HANDLE direct_objs[MAXIMUM_WAIT_OBJECTS], *waits;
+    unsigned int i;
+    DWORD res;
+
+    /* an alertable wait isn't strictly necessary, but due to our
+     * overlapped I/O implementation in Wine we need to free some memory
+     * by the file user APC being called, even if no completion routine was
+     * specified at the time of starting the async operation */
+    if (count <= MAXIMUM_WAIT_OBJECTS)
+    {
+        do res = WaitForMultipleObjectsEx(count, objs, FALSE, INFINITE, TRUE);
+        while (res == WAIT_IO_COMPLETION);
+        return res;
+    }
+
+    if (!npps->wake_event && !(npps->wake_event = CreateEventW(NULL, FALSE, FALSE, NULL)))
+        return WAIT_FAILED;
+    if (!(waits = calloc(count - direct, sizeof(*waits))))
+        return WAIT_FAILED;
+
+    res = WAIT_OBJECT_0;
+    for (i = direct; i < count; i++)
+    {
+        if (!RegisterWaitForSingleObject(&waits[i - direct], objs[i], np_listener_signaled,
+                                         npps->wake_event, INFINITE, WT_EXECUTEONLYONCE))
+        {
+            ERR("RegisterWaitForSingleObject failed with error %lu\n", GetLastError());
+            waits[i - direct] = NULL;
+            res = WAIT_FAILED;
+            break;
+        }
+    }
+
+    if (res != WAIT_FAILED)
+    {
+        memcpy(direct_objs, objs, direct * sizeof(*objs));
+        direct_objs[direct] = npps->wake_event;
+        do res = WaitForMultipleObjectsEx(MAXIMUM_WAIT_OBJECTS, direct_objs, FALSE, INFINITE, TRUE);
+        while (res == WAIT_IO_COMPLETION);
+    }
+
+    for (i = 0; i < count - direct; i++)
+        if (waits[i]) UnregisterWaitEx(waits[i], INVALID_HANDLE_VALUE);
+    free(waits);
+    ResetEvent(npps->wake_event);
+
+    if (res != WAIT_OBJECT_0 + direct)
+        return res;
+
+    /* The listen events are manual-reset, so the one that woke us is still signaled. */
+    for (i = direct; i < count; i++)
+        if (WaitForSingleObject(objs[i], 0) == WAIT_OBJECT_0)
+            return WAIT_OBJECT_0 + i;
+    return WAIT_TIMEOUT;
+}
+
 static int rpcrt4_protseq_np_wait_for_new_connection(RpcServerProtseq *protseq, unsigned int count, void *wait_array)
 {
     HANDLE b_handle;
@@ -721,17 +793,12 @@ static int rpcrt4_protseq_np_wait_for_new_connection(RpcServerProtseq *protseq, 
     if (!objs)
         return -1;
 
-    do
-    {
-        /* an alertable wait isn't strictly necessary, but due to our
-         * overlapped I/O implementation in Wine we need to free some memory
-         * by the file user APC being called, even if no completion routine was
-         * specified at the time of starting the async operation */
-        res = WaitForMultipleObjectsEx(count, objs, FALSE, INFINITE, TRUE);
-    } while (res == WAIT_IO_COMPLETION);
+    res = np_wait_for_listeners(protseq, count, objs);
 
     if (res == WAIT_OBJECT_0)
         return 0;
+    else if (res == WAIT_TIMEOUT)
+        return 1;
     else if (res == WAIT_FAILED)
     {
         ERR("wait failed with error %ld\n", GetLastError());
