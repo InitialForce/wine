@@ -5854,6 +5854,72 @@ static void test_GetLocaleInfoEx(void)
         ret = pGetLocaleInfoEx(dummyW, LOCALE_SNAME, bufferW, ARRAY_SIZE(bufferW));
         ok(!ret && GetLastError() == ERROR_INVALID_PARAMETER, "got %d, error %ld\n", ret, GetLastError());
 
+        /* well-formed names that are not predefined are custom locales on Windows 10 and later */
+        ret = pGetLocaleInfoEx(L"bgc_in", LOCALE_SNAME, bufferW, ARRAY_SIZE(bufferW));
+        ok(ret || broken(!ret) /* before Windows 10 */, "got %d, error %ld\n", ret, GetLastError());
+        if (ret)
+        {
+            static const struct { const WCHAR *name; LCTYPE type; const WCHAR *expect; } custom[] =
+            {
+                { L"bgc", LOCALE_SNAME, L"bgc" },
+                { L"bgc", LOCALE_SPARENT, L"" },
+                { L"bgc", LOCALE_SISO3166CTRYNAME, L"ZZ" },
+                { L"bgc", LOCALE_SENGLISHDISPLAYNAME, L"Unknown Locale (bgc)" },
+                { L"bgc", LOCALE_SENGLISHLANGUAGENAME, L"Unknown Language (bgc)" },
+                { L"bgc", LOCALE_SSCRIPTS, L"Latn;" },
+                { L"bgc", LOCALE_SDECIMAL, L"." },
+                { L"bgc", LOCALE_SSHORTDATE, L"MM/dd/yyyy" },
+                { L"BGC-in", LOCALE_SNAME, L"bgc-IN" },
+                { L"bgc-in", LOCALE_SPARENT, L"bgc" },
+                { L"bgc-in", LOCALE_SISO639LANGNAME, L"bgc" },
+                { L"bgc-in", LOCALE_SISO3166CTRYNAME, L"IN" },
+                { L"bgc-in", LOCALE_SENGLISHCOUNTRYNAME, L"Unknown Region (IN)" },
+                { L"bgc-deva-in", LOCALE_SNAME, L"bgc-Deva-IN" },
+                { L"bgc-deva-in", LOCALE_SPARENT, L"bgc-Deva" },
+                { L"bgc-deva-in", LOCALE_SSCRIPTS, L"Deva;" },
+                { L"zz-419", LOCALE_SNAME, L"zz-419" },
+                { L"zz-419", LOCALE_SISO3166CTRYNAME, L"419" },
+                { L"en-US-x-foo", LOCALE_SNAME, L"en-US-x-foo" },
+                { L"en-US-x-foo", LOCALE_SPARENT, L"en-US" },
+                { L"en-US-x-foo", LOCALE_SENGLISHDISPLAYNAME, L"Unknown Locale (en-US-x-foo)" },
+                { L"en-US-POSIX", LOCALE_SNAME, L"en-US-posix" },
+                { L"en-US-POSIX", LOCALE_SPARENT, L"en-US" },
+                { L"en-US-POSIX-x-a", LOCALE_SPARENT, L"en-US-posix" },
+                { L"fr-XY", LOCALE_SDECIMAL, L"," },
+                { L"fr-XY", LOCALE_SSHORTDATE, L"dd/MM/yyyy" },
+            };
+            static const WCHAR *invalid[] = { L"a", L"dummy", L"zz-ZZZ", L"broken!", L"toolonglanguage",
+                                            L"en-POSIX", L"en-US-123456789" };
+            unsigned int i;
+
+            for (i = 0; i < ARRAY_SIZE(custom); i++)
+            {
+                bufferW[0] = 0;
+                ret = pGetLocaleInfoEx(custom[i].name, custom[i].type, bufferW, ARRAY_SIZE(bufferW));
+                ok(ret == lstrlenW(bufferW) + 1, "%s %#lx: got %d\n", wine_dbgstr_w(custom[i].name), custom[i].type, ret);
+                ok(!lstrcmpW(bufferW, custom[i].expect), "%s %#lx: got %s\n", wine_dbgstr_w(custom[i].name),
+                   custom[i].type, wine_dbgstr_w(bufferW));
+            }
+
+            val = 0;
+            ret = pGetLocaleInfoEx(L"bgc-IN", LOCALE_ILANGUAGE | LOCALE_RETURN_NUMBER, (WCHAR *)&val, sizeof(val) / sizeof(WCHAR));
+            ok(ret == 2 && val == LOCALE_CUSTOM_UNSPECIFIED, "got %d, %#lx\n", ret, val);
+            val = 0xdeadbeef;
+            ret = pGetLocaleInfoEx(L"bgc-IN", LOCALE_INEUTRAL | LOCALE_RETURN_NUMBER, (WCHAR *)&val, sizeof(val) / sizeof(WCHAR));
+            ok(ret == 2 && val == 0, "got %d, %#lx\n", ret, val);
+            val = 0;
+            ret = pGetLocaleInfoEx(L"bgc", LOCALE_INEUTRAL | LOCALE_RETURN_NUMBER, (WCHAR *)&val, sizeof(val) / sizeof(WCHAR));
+            ok(ret == 2 && val == 1, "got %d, %#lx\n", ret, val);
+
+            for (i = 0; i < ARRAY_SIZE(invalid); i++)
+            {
+                SetLastError(0xdeadbeef);
+                ret = pGetLocaleInfoEx(invalid[i], LOCALE_SNAME, bufferW, ARRAY_SIZE(bufferW));
+                ok(!ret && GetLastError() == ERROR_INVALID_PARAMETER, "%s: got %d, error %ld\n",
+                   wine_dbgstr_w(invalid[i]), ret, GetLastError());
+            }
+        }
+
         while (*ptr->name)
         {
             val = 0;

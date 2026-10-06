@@ -6109,6 +6109,178 @@ INT WINAPI DECLSPEC_HOTPATCH GetLocaleInfoW( LCID lcid, LCTYPE lctype, WCHAR *bu
 }
 
 
+/* A well-formed locale name that is not in locale.nls. Windows 10 and later answer for such
+ * names with LCID LOCALE_CUSTOM_UNSPECIFIED, generic names, and the formats of the closest
+ * known locale (the invariant locale when the language is unknown). */
+struct custom_locale
+{
+    WCHAR name[LOCALE_NAME_MAX_LENGTH];
+    WCHAR parent[LOCALE_NAME_MAX_LENGTH];
+    WCHAR lang[4];
+    WCHAR script[5];
+    WCHAR region[4];
+    const NLS_LOCALE_DATA *base;
+    LCID base_lcid;
+};
+
+static BOOL is_ascii_alpha( WCHAR ch )
+{
+    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
+}
+
+static BOOL is_ascii_digit( WCHAR ch )
+{
+    return ch >= '0' && ch <= '9';
+}
+
+static WCHAR ascii_lower( WCHAR ch )
+{
+    return (ch >= 'A' && ch <= 'Z') ? ch + 'a' - 'A' : ch;
+}
+
+static WCHAR ascii_upper( WCHAR ch )
+{
+    return (ch >= 'a' && ch <= 'z') ? ch - 'a' + 'A' : ch;
+}
+
+/* Parse language[-Script][-REGION[-variant...]][-singleton-extension...], with '-' or '_'
+ * between subtags. The language is 2 or 3 letters, the script 4 letters, the region 2 letters
+ * or 3 digits, and each variant or extension subtag 1 to 8 letters or digits. As on Windows,
+ * a variant needs a region. */
+static BOOL parse_custom_locale( const WCHAR *name, struct custom_locale *cl )
+{
+    const WCHAR *p = name, *start;
+    WCHAR core[LOCALE_NAME_MAX_LENGTH];
+    LCID lcid;
+    int i, n, part = 0, pos = 0, core_len = 0;
+    BOOL ext = FALSE;
+
+    memset( cl, 0, sizeof(*cl) );
+    if (!name || !name[0] || name == LOCALE_NAME_USER_DEFAULT || name[0] == '!') return FALSE;
+
+    for (;;)
+    {
+        start = p;
+        while (is_ascii_alpha( *p ) || is_ascii_digit( *p )) p++;
+        n = p - start;
+        if (n < 1 || n > 8 || (*p && *p != '-' && *p != '_')) return FALSE;
+        if (pos + n + 1 >= LOCALE_NAME_MAX_LENGTH) return FALSE;
+        if (pos) cl->name[pos++] = '-';
+
+        if (ext)
+        {
+            for (i = 0; i < n; i++) cl->name[pos++] = ascii_lower( start[i] );
+        }
+        else if (part == 0)
+        {
+            if (n < 2 || n > 3) return FALSE;
+            for (i = 0; i < n; i++)
+            {
+                if (!is_ascii_alpha( start[i] )) return FALSE;
+                cl->lang[i] = cl->name[pos++] = ascii_lower( start[i] );
+            }
+            part = 1;
+        }
+        else if (part == 1 && n == 4 && is_ascii_alpha( start[0] ) && is_ascii_alpha( start[1] ) &&
+                 is_ascii_alpha( start[2] ) && is_ascii_alpha( start[3] ))
+        {
+            for (i = 0; i < n; i++)
+                cl->script[i] = cl->name[pos++] = i ? ascii_lower( start[i] ) : ascii_upper( start[i] );
+            part = 2;
+        }
+        else if (part <= 2 && ((n == 2 && is_ascii_alpha( start[0] ) && is_ascii_alpha( start[1] )) ||
+                               (n == 3 && is_ascii_digit( start[0] ) && is_ascii_digit( start[1] ) &&
+                                is_ascii_digit( start[2] ))))
+        {
+            for (i = 0; i < n; i++) cl->region[i] = cl->name[pos++] = ascii_upper( start[i] );
+            part = 3;
+        }
+        else if (n == 1)
+        {
+            core_len = pos - 1;
+            cl->name[pos++] = ascii_lower( start[0] );
+            ext = TRUE;
+        }
+        else if (part == 3)
+        {
+            for (i = 0; i < n; i++) cl->name[pos++] = ascii_lower( start[i] );
+        }
+        else return FALSE;
+
+        if (!*p) break;
+        p++;
+    }
+    if (!ext) core_len = pos;
+    cl->name[pos] = 0;
+    memcpy( core, cl->name, core_len * sizeof(WCHAR) );
+    core[core_len] = 0;
+
+    /* the parent drops the extensions, or else the last subtag */
+    lstrcpynW( cl->parent, core, ARRAY_SIZE(cl->parent) );
+    if (!ext)
+    {
+        WCHAR *last = wcsrchr( cl->parent, '-' );
+        if (last) *last = 0;
+        else cl->parent[0] = 0;
+    }
+
+    /* take the data of the closest known locale */
+    for (;;)
+    {
+        WCHAR *last;
+        if ((cl->base = get_locale_by_name( core, &lcid ))) break;
+        if (!(last = wcsrchr( core, '-' ))) break;
+        *last = 0;
+    }
+    if (!cl->base) cl->base = get_locale_by_name( LOCALE_NAME_INVARIANT, &lcid );
+    cl->base_lcid = lcid;
+    return cl->base != NULL;
+}
+
+static int custom_locale_return_string( const WCHAR *format, const WCHAR *arg, LCTYPE type,
+                                        WCHAR *buffer, int len )
+{
+    WCHAR tmp[LOCALE_NAME_MAX_LENGTH + 32];
+    int ret = swprintf( tmp, ARRAY_SIZE(tmp), format, arg ) + 1;
+    return locale_return_data( tmp, ret, type, buffer, len );
+}
+
+static int get_custom_locale_info( const struct custom_locale *cl, LCTYPE type, WCHAR *buffer, int len )
+{
+    switch (LOWORD(type))
+    {
+    case LOCALE_ILANGUAGE:
+        return locale_return_number( LOCALE_CUSTOM_UNSPECIFIED, type, buffer, len );
+    case LOCALE_INEUTRAL:
+        return locale_return_number( !cl->region[0], type, buffer, len );
+    case LOCALE_SNAME:
+        return custom_locale_return_string( L"%s", cl->name, type, buffer, len );
+    case LOCALE_SPARENT:
+        return custom_locale_return_string( L"%s", cl->parent, type, buffer, len );
+    case LOCALE_SISO639LANGNAME:
+        return custom_locale_return_string( L"%s", cl->lang, type, buffer, len );
+    case LOCALE_SISO3166CTRYNAME:
+        return custom_locale_return_string( L"%s", cl->region[0] ? cl->region : L"ZZ", type, buffer, len );
+    case LOCALE_SSCRIPTS:
+        return custom_locale_return_string( L"%s;", cl->script[0] ? cl->script : L"Latn", type, buffer, len );
+    case LOCALE_SLOCALIZEDDISPLAYNAME:
+    case LOCALE_SENGLISHDISPLAYNAME:
+    case LOCALE_SNATIVEDISPLAYNAME:
+        return custom_locale_return_string( L"Unknown Locale (%s)", cl->name, type, buffer, len );
+    case LOCALE_SLOCALIZEDLANGUAGENAME:
+    case LOCALE_SENGLISHLANGUAGENAME:
+    case LOCALE_SNATIVELANGUAGENAME:
+        return custom_locale_return_string( L"Unknown Language (%s)", cl->lang, type, buffer, len );
+    case LOCALE_SLOCALIZEDCOUNTRYNAME:
+    case LOCALE_SENGLISHCOUNTRYNAME:
+    case LOCALE_SNATIVECOUNTRYNAME:
+        return custom_locale_return_string( L"Unknown Region (%s)", cl->region[0] ? cl->region : L"ZZ",
+                                            type, buffer, len );
+    }
+    return get_locale_info( cl->base, cl->base_lcid, type | LOCALE_NOUSEROVERRIDE, buffer, len );
+}
+
+
 /******************************************************************************
  *	GetLocaleInfoEx   (kernelbase.@)
  */
@@ -6116,11 +6288,14 @@ INT WINAPI DECLSPEC_HOTPATCH GetLocaleInfoEx( const WCHAR *name, LCTYPE info, WC
 {
     LCID lcid;
     const NLS_LOCALE_DATA *locale = get_locale_by_name( name, &lcid );
+    struct custom_locale custom;
 
     TRACE( "%s 0x%lx %p %d\n", debugstr_w(name), info, buffer, len );
 
     if (!locale)
     {
+        if (parse_custom_locale( name, &custom ))
+            return get_custom_locale_info( &custom, info, buffer, len );
         SetLastError( ERROR_INVALID_PARAMETER );
         return 0;
     }
