@@ -43,6 +43,28 @@ static const char jpeg_adobe_cmyk_1x5[] =
     "\x00\x00\xff\xda\x00\x0e\x04\x01\x00\x02\x11\x03\x11\x04\x00\x00"
     "\x3f\x00\x40\x44\x02\x1e\xa4\x1f\xff\xd9";
 
+/* 32x16, 4:2:0 subsampled: columns 0-15 are red (200,40,40), 16-31 blue (40,40,200). */
+static const char jpeg_ycbcr420_32x16[] =
+    "\xff\xd8\xff\xe0\x00\x10\x4a\x46\x49\x46\x00\x01\x01\x00\x00\x01"
+    "\x00\x01\x00\x00\xff\xdb\x00\x43\x00\x01\x01\x01\x01\x01\x01\x01"
+    "\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01"
+    "\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01"
+    "\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01"
+    "\x01\x01\x01\x01\x01\x01\x01\x01\x01\xff\xdb\x00\x43\x01\x01\x01"
+    "\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01"
+    "\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01"
+    "\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01"
+    "\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\xff\xc0"
+    "\x00\x11\x08\x00\x10\x00\x20\x03\x01\x22\x00\x02\x11\x01\x03\x11"
+    "\x01\xff\xc4\x00\x16\x00\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00"
+    "\x00\x00\x00\x00\x00\x00\x00\x08\x09\xff\xc4\x00\x14\x10\x01\x00"
+    "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff"
+    "\xc4\x00\x15\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    "\x00\x00\x00\x00\x0a\x08\xff\xc4\x00\x14\x11\x01\x00\x00\x00\x00"
+    "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xda\x00\x0c"
+    "\x03\x01\x00\x02\x11\x03\x11\x00\x3f\x00\xcb\xf0\x11\x39\x40\x20"
+    "\xf0\x0d\x60\x45\xdf\xff\xd9";
+
 static void test_decode_adobe_cmyk(void)
 {
     IWICBitmapDecoder *decoder;
@@ -154,12 +176,74 @@ static void test_decode_adobe_cmyk(void)
     IWICImagingFactory_Release(factory);
 }
 
+static void test_decode_ycbcr420(void)
+{
+    static const BYTE red[3] = { 0x28, 0x28, 0xc8 }, blue[3] = { 0xc8, 0x28, 0x28 };
+    /* Windows interpolates the chroma between the two samples next to each
+     * output pixel, so the colours blend across the edge at x = 16, which is
+     * also the edge between two chroma blocks. */
+    static const BYTE edge[6] = { 0x58, 0x2f, 0xa8, 0x98, 0x21, 0x48 };
+    IWICBitmapDecoder *decoder;
+    IWICBitmapFrameDecode *frame;
+    IWICImagingFactory *factory;
+    IWICStream *stream;
+    BYTE expected[32 * 3], imagedata[32 * 3 * 16];
+    UINT width, height, x, y, diff;
+    GUID format;
+    HRESULT hr;
+
+    for (x = 0; x < 15; x++) memcpy(expected + x * 3, red, 3);
+    memcpy(expected + 15 * 3, edge, 6);
+    for (x = 17; x < 32; x++) memcpy(expected + x * 3, blue, 3);
+
+    hr = CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+        &IID_IWICImagingFactory, (void **)&factory);
+    ok(hr == S_OK, "CoCreateInstance failed, hr=%lx\n", hr);
+
+    hr = IWICImagingFactory_CreateStream(factory, &stream);
+    ok(hr == S_OK, "CreateStream failed, hr=%lx\n", hr);
+    hr = IWICStream_InitializeFromMemory(stream, (BYTE *)jpeg_ycbcr420_32x16, sizeof(jpeg_ycbcr420_32x16) - 1);
+    ok(hr == S_OK, "InitializeFromMemory failed, hr=%lx\n", hr);
+
+    hr = IWICImagingFactory_CreateDecoderFromStream(factory, (IStream *)stream, NULL,
+        WICDecodeMetadataCacheOnLoad, &decoder);
+    ok(hr == S_OK, "CreateDecoderFromStream failed, hr=%lx\n", hr);
+
+    hr = IWICBitmapDecoder_GetFrame(decoder, 0, &frame);
+    ok(hr == S_OK, "GetFrame failed, hr=%lx\n", hr);
+
+    hr = IWICBitmapFrameDecode_GetSize(frame, &width, &height);
+    ok(hr == S_OK, "GetSize failed, hr=%lx\n", hr);
+    ok(width == 32 && height == 16, "got size %ux%u\n", width, height);
+
+    hr = IWICBitmapFrameDecode_GetPixelFormat(frame, &format);
+    ok(hr == S_OK, "GetPixelFormat failed, hr=%lx\n", hr);
+    ok(IsEqualGUID(&format, &GUID_WICPixelFormat24bppBGR), "got format %s\n", wine_dbgstr_guid(&format));
+
+    hr = IWICBitmapFrameDecode_CopyPixels(frame, NULL, 32 * 3, sizeof(imagedata), imagedata);
+    ok(hr == S_OK, "CopyPixels failed, hr=%lx\n", hr);
+
+    for (y = 0; y < 16; y++)
+    {
+        for (x = 0, diff = 0; x < 32 * 3; x++)
+            if (imagedata[y * 32 * 3 + x] != expected[x]) diff++;
+        ok(!diff, "row %u: %u bytes differ, pixels 15 and 16 are %02x%02x%02x %02x%02x%02x\n", y, diff,
+            imagedata[y * 96 + 45], imagedata[y * 96 + 46], imagedata[y * 96 + 47],
+            imagedata[y * 96 + 48], imagedata[y * 96 + 49], imagedata[y * 96 + 50]);
+    }
+
+    IWICBitmapFrameDecode_Release(frame);
+    IWICBitmapDecoder_Release(decoder);
+    IWICStream_Release(stream);
+    IWICImagingFactory_Release(factory);
+}
 
 START_TEST(jpegformat)
 {
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
     test_decode_adobe_cmyk();
+    test_decode_ycbcr420();
 
     CoUninitialize();
 }

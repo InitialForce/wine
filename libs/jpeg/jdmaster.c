@@ -46,16 +46,14 @@ use_merged_upsample (j_decompress_ptr cinfo)
 {
 #ifdef UPSAMPLE_MERGING_SUPPORTED
   /* Merging is the equivalent of plain box-filter upsampling. */
-  /* The following condition is only needed if fancy shall select
-   * a different upsampling method.  In our current implementation
-   * fancy only affects the DCT scaling, thus we can use fancy
-   * upsampling and merged upsample simultaneously, in particular
-   * with scaled DCT sizes larger than the default DCTSIZE.
+  /* At full size, fancy upsampling uses the triangle filter in jdsample.c.
+   * Scaled output does fancy upsampling by DCT scaling only, so it can use
+   * merged upsample as well.
    */
-#if 0
-  if (cinfo->do_fancy_upsampling)
+  if (cinfo->do_fancy_upsampling &&
+      cinfo->min_DCT_h_scaled_size == DCTSIZE &&
+      cinfo->min_DCT_v_scaled_size == DCTSIZE)
     return FALSE;
-#endif
   if (cinfo->CCIR601_sampling)
     return FALSE;
   /* jdmerge.c only supports YCC=>RGB color conversion */
@@ -105,6 +103,9 @@ jpeg_calc_output_dimensions (j_decompress_ptr cinfo)
 {
   int ci, i;
   jpeg_component_info *compptr;
+#ifdef IDCT_SCALING_SUPPORTED
+  boolean fancy_scaling;
+#endif
 
   /* Prevent application from calling me at wrong times */
   if (cinfo->global_state != DSTATE_READY)
@@ -118,14 +119,19 @@ jpeg_calc_output_dimensions (j_decompress_ptr cinfo)
   /* In selecting the actual DCT scaling for each component, we try to
    * scale up the chroma components via IDCT scaling rather than upsampling.
    * This saves time if the upsampler gets to use 1:1 scaling.
+   * At full size, fancy upsampling leaves the chroma components at DCTSIZE
+   * and uses the triangle filter in jdsample.c, as libjpeg 6b and Windows do.
    * Note this code adapts subsampling ratios which are powers of 2.
    */
+  fancy_scaling = cinfo->do_fancy_upsampling &&
+    ! (cinfo->min_DCT_h_scaled_size == DCTSIZE &&
+       cinfo->min_DCT_v_scaled_size == DCTSIZE);
   for (ci = 0, compptr = cinfo->comp_info; ci < cinfo->num_components;
        ci++, compptr++) {
     int ssize = 1;
     if (! cinfo->raw_data_out)
       while (cinfo->min_DCT_h_scaled_size * ssize <=
-	     (cinfo->do_fancy_upsampling ? DCTSIZE : DCTSIZE / 2) &&
+	     (fancy_scaling ? DCTSIZE : DCTSIZE / 2) &&
 	     (cinfo->max_h_samp_factor % (compptr->h_samp_factor * ssize * 2)) ==
 	     0) {
 	ssize = ssize * 2;
@@ -134,7 +140,7 @@ jpeg_calc_output_dimensions (j_decompress_ptr cinfo)
     ssize = 1;
     if (! cinfo->raw_data_out)
       while (cinfo->min_DCT_v_scaled_size * ssize <=
-	     (cinfo->do_fancy_upsampling ? DCTSIZE : DCTSIZE / 2) &&
+	     (fancy_scaling ? DCTSIZE : DCTSIZE / 2) &&
 	     (cinfo->max_v_samp_factor % (compptr->v_samp_factor * ssize * 2)) ==
 	     0) {
 	ssize = ssize * 2;
