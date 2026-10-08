@@ -294,10 +294,17 @@ DEFINE_IINSPECTABLE( application_data_statics, IApplicationDataStatics, struct a
 static HRESULT WINAPI application_data_statics_get_Current( IApplicationDataStatics *iface, IApplicationData **value )
 {
     struct application_data *impl;
+    UINT32 length = 0;
 
     TRACE( "iface %p, value %p\n", iface, value );
 
     if (!value) return E_INVALIDARG;
+    /* Application data belongs to a package, so a process without package identity has none. */
+    if (GetCurrentPackageFamilyName( &length, NULL ) == APPMODEL_ERROR_NO_PACKAGE)
+    {
+        *value = NULL;
+        return HRESULT_FROM_WIN32( APPMODEL_ERROR_NO_PACKAGE );
+    }
     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
 
     impl->IApplicationData_iface.lpVtbl = &application_data_vtbl;
