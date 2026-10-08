@@ -26,6 +26,7 @@
 #include "windef.h"
 #include "winbase.h"
 #include "winstring.h"
+#include "appmodel.h"
 
 #include "activation.h"
 
