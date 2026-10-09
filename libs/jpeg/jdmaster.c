@@ -48,9 +48,11 @@ use_merged_upsample (j_decompress_ptr cinfo)
   /* Merging is the equivalent of plain box-filter upsampling. */
   /* At full size, fancy upsampling uses the triangle filter in jdsample.c.
    * Scaled output does fancy upsampling by DCT scaling only, so it can use
-   * merged upsample as well.
+   * merged upsample as well.  Full size means 8x8 source blocks decoded to
+   * 8x8: with SmartScale blocks of another size, an 8x8 output is scaled.
    */
   if (cinfo->do_fancy_upsampling &&
+      cinfo->block_size == DCTSIZE &&
       cinfo->min_DCT_h_scaled_size == DCTSIZE &&
       cinfo->min_DCT_v_scaled_size == DCTSIZE)
     return FALSE;
@@ -124,7 +126,8 @@ jpeg_calc_output_dimensions (j_decompress_ptr cinfo)
    * Note this code adapts subsampling ratios which are powers of 2.
    */
   fancy_scaling = cinfo->do_fancy_upsampling &&
-    ! (cinfo->min_DCT_h_scaled_size == DCTSIZE &&
+    ! (cinfo->block_size == DCTSIZE &&
+       cinfo->min_DCT_h_scaled_size == DCTSIZE &&
        cinfo->min_DCT_v_scaled_size == DCTSIZE);
   for (ci = 0, compptr = cinfo->comp_info; ci < cinfo->num_components;
        ci++, compptr++) {

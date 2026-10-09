@@ -399,11 +399,13 @@ jinit_upsampler (j_decompress_ptr cinfo)
   if (cinfo->CCIR601_sampling)	/* this isn't supported */
     ERREXIT(cinfo, JERR_CCIR601_NOTIMPL);
 
-  /* The triangle filter is for full-size output only.  Scaled output keeps
+  /* The triangle filter is for full-size output of 8x8-block JPEGs only.
+   * Scaled output, and SmartScale JPEGs with other block sizes, keep
    * upsampling by IDCT scaling (see jpeg_calc_output_dimensions) or the box
    * filter.
    */
-  do_fancy = cinfo->do_fancy_upsampling && cinfo->min_DCT_h_scaled_size == DCTSIZE &&
+  do_fancy = cinfo->do_fancy_upsampling && cinfo->block_size == DCTSIZE &&
+	     cinfo->min_DCT_h_scaled_size == DCTSIZE &&
 	     cinfo->min_DCT_v_scaled_size == DCTSIZE;
 
   /* Verify we can handle the sampling factors, select per-component methods,
