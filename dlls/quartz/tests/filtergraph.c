@@ -7461,6 +7461,59 @@ static void test_implicit_fullscreen_support(void)
     pump_messages();
 }
 
+static void test_object_with_site(void)
+{
+    IFilterGraph2 *graph = create_graph(), *site = create_graph();
+    IObjectWithSite *object_with_site;
+    IUnknown *unk;
+    HRESULT hr;
+    ULONG ref;
+
+    hr = IFilterGraph2_QueryInterface(graph, &IID_IObjectWithSite, (void **)&object_with_site);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+
+    unk = (IUnknown *)0xdeadbeef;
+    hr = IObjectWithSite_GetSite(object_with_site, &IID_IUnknown, (void **)&unk);
+    ok(hr == E_FAIL, "Got hr %#lx.\n", hr);
+    ok(!unk, "Got site %p.\n", unk);
+
+    hr = IObjectWithSite_SetSite(object_with_site, NULL);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+
+    ref = get_refcount(site);
+    ok(ref == 1, "Got refcount %lu.\n", ref);
+    hr = IObjectWithSite_SetSite(object_with_site, (IUnknown *)site);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ref = get_refcount(site);
+    ok(ref == 2, "Got refcount %lu.\n", ref);
+
+    hr = IObjectWithSite_SetSite(object_with_site, (IUnknown *)site);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ref = get_refcount(site);
+    ok(ref == 2, "Got refcount %lu.\n", ref);
+
+    hr = IObjectWithSite_GetSite(object_with_site, &IID_IUnknown, (void **)&unk);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ok(!!unk, "Expected a site.\n");
+    IUnknown_Release(unk);
+
+    hr = IObjectWithSite_SetSite(object_with_site, NULL);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ref = get_refcount(site);
+    ok(ref == 1, "Got refcount %lu.\n", ref);
+
+    unk = (IUnknown *)0xdeadbeef;
+    hr = IObjectWithSite_GetSite(object_with_site, &IID_IUnknown, (void **)&unk);
+    ok(hr == E_FAIL, "Got hr %#lx.\n", hr);
+    ok(!unk, "Got site %p.\n", unk);
+
+    IObjectWithSite_Release(object_with_site);
+    ref = IFilterGraph2_Release(graph);
+    ok(!ref, "Got outstanding refcount %ld.\n", ref);
+    ref = IFilterGraph2_Release(site);
+    ok(!ref, "Got outstanding refcount %ld.\n", ref);
+}
+
 START_TEST(filtergraph)
 {
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
@@ -7491,6 +7544,7 @@ START_TEST(filtergraph)
     test_events();
     test_event_dispatch();
     test_implicit_fullscreen_support();
+    test_object_with_site();
 
     CoUninitialize();
     test_render_with_multithread();

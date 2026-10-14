@@ -2848,10 +2848,10 @@ static HRESULT WINAPI ObjectWithSite_SetSite(IObjectWithSite *iface, IUnknown *p
 {
     struct filter_graph *This = impl_from_IObjectWithSite( iface );
 
-    TRACE("(%p/%p)->()\n", This, iface);
+    TRACE("(%p/%p)->(%p)\n", This, iface, pUnkSite);
+    if (pUnkSite) IUnknown_AddRef(pUnkSite);
     if (This->pSite) IUnknown_Release(This->pSite);
     This->pSite = pUnkSite;
-    IUnknown_AddRef(This->pSite);
     return S_OK;
 }
 
