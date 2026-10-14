@@ -705,6 +705,15 @@ void X11DRV_ThreadDetach(void)
 }
 
 
+/* NtTerminateProcess with a null handle only stops the other threads and returns. A thread
+ * that went on could crash, or wait for good on a lock one of the stopped threads held. */
+static void terminate_process( int exit_code )
+{
+    NtTerminateProcess( 0, exit_code );
+    NtTerminateProcess( NtCurrentProcess(), exit_code );
+}
+
+
 /* store the display fd into the message queue */
 static void set_queue_display_fd( Display *display )
 {
@@ -714,7 +723,7 @@ static void set_queue_display_fd( Display *display )
     if (wine_server_fd_to_handle( ConnectionNumber(display), GENERIC_READ | SYNCHRONIZE, 0, &handle ))
     {
         MESSAGE( "x11drv: Can't allocate handle for display fd\n" );
-        NtTerminateProcess( 0, 1 );
+        terminate_process( 1 );
     }
     SERVER_START_REQ( set_queue_fd )
     {
@@ -725,7 +734,7 @@ static void set_queue_display_fd( Display *display )
     if (ret)
     {
         MESSAGE( "x11drv: Can't store handle for display fd\n" );
-        NtTerminateProcess( 0, 1 );
+        terminate_process( 1 );
     }
     NtClose( handle );
 }
@@ -743,12 +752,12 @@ struct x11drv_thread_data *x11drv_init_thread_data(void)
     if (!(data = calloc( 1, sizeof(*data) )))
     {
         ERR( "could not create data\n" );
-        NtTerminateProcess( 0, 1 );
+        terminate_process( 1 );
     }
     if (!(data->display = XOpenDisplay(NULL)))
     {
         ERR_(winediag)( "x11drv: Can't open display: %s. Please ensure that your X server is running and that $DISPLAY is set correctly.\n", XDisplayName(NULL));
-        NtTerminateProcess( 0, 1 );
+        terminate_process( 1 );
     }
 
     fcntl( ConnectionNumber(data->display), F_SETFD, 1 ); /* set close on exec flag */
