@@ -618,7 +618,8 @@ static void sync_window_region( struct x11drv_win_data *data, HRGN win_region )
     HRGN hrgn = win_region;
 
     if (!data->whole_window) return;
-    if (client_side_graphics) return; /* use surface shape instead */
+    /* the window surface sets the shape, unless a client window is drawn to directly */
+    if (client_side_graphics && !data->client_window) return;
     data->shaped = FALSE;
 
     if (hrgn == (HRGN)1)  /* hack: win_region == 1 means retrieve region from server */
@@ -2346,6 +2347,10 @@ void attach_client_window( struct x11drv_win_data *data, Window client_window )
     }
 
     data->client_window = client_window;
+
+    /* the window has no window surface while the client window is attached, so the shape the
+     * last surface set would otherwise stay, even after the window region changes */
+    sync_window_region( data, (HRGN)1 );
 }
 
 
