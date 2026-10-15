@@ -4240,6 +4240,14 @@ static void testAcquireCertPrivateKey(void)
         ok(GetLastError() == ERROR_SUCCESS, "got %08lx\n", GetLastError());
         CryptReleaseContext(certCSP, 0);
 
+        /* A caller asking for a CNG key handle never gets a CryptoAPI provider */
+        keySpec = 0xdeadbeef;
+        ret = CryptAcquireCertificatePrivateKey(cert,
+         CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG, NULL, &certCSP, &keySpec,
+         &callerFree);
+        ok(!ret || keySpec == CERT_NCRYPT_KEY_SPEC,
+         "Expected failure or CERT_NCRYPT_KEY_SPEC, got %lx\n", keySpec);
+
         /* Use the key prov info's caching (there shouldn't be any) */
         SetLastError(0xdeadbeef);
         ret = CryptAcquireCertificatePrivateKey(cert,
@@ -4261,6 +4269,14 @@ static void testAcquireCertPrivateKey(void)
         ret = CertGetCertificateContextProperty(cert, CERT_KEY_CONTEXT_PROP_ID,
          &keyContext, &size);
         ok(ret, "CertGetCertificateContextProperty failed: %08lx\n", GetLastError());
+
+        /* The cached CryptoAPI provider is not a CNG key handle either */
+        keySpec = 0xdeadbeef;
+        ret = CryptAcquireCertificatePrivateKey(cert,
+         CRYPT_ACQUIRE_CACHE_FLAG | CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG, NULL,
+         &certCSP, &keySpec, &callerFree);
+        ok(!ret || keySpec == CERT_NCRYPT_KEY_SPEC,
+         "Expected failure or CERT_NCRYPT_KEY_SPEC, got %lx\n", keySpec);
 
         /* Remove the cached provider */
         CryptReleaseContext(keyContext.hCryptProv, 0);

@@ -979,6 +979,14 @@ static BOOL CRYPT_AcquirePrivateKeyFromProvInfo(PCCERT_CONTEXT pCert, DWORD dwFl
         else
             SetLastError(CRYPT_E_NO_KEY_PROPERTY);
     }
+    if (ret && (dwFlags & CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG))
+    {
+        /* The key is acquired through a CryptoAPI provider, which gives no CNG key handle. */
+        FIXME("no CNG key handle for container %s of provider %s\n",
+              debugstr_w(info->pwszContainerName), debugstr_w(info->pwszProvName));
+        SetLastError(NTE_BAD_PROV_TYPE);
+        ret = FALSE;
+    }
     if (ret)
     {
         ret = CryptAcquireContextW(phCryptProv, info->pwszContainerName, info->pwszProvName, info->dwProvType, flags);
@@ -1070,6 +1078,9 @@ BOOL WINAPI CryptAcquireCertificatePrivateKey(PCCERT_CONTEXT pCert,
         size = sizeof(keyContext);
         ret = CertGetCertificateContextProperty(pCert, CERT_KEY_CONTEXT_PROP_ID,
          &keyContext, &size);
+        if (ret && (dwFlags & CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG) &&
+            keyContext.dwKeySpec != CERT_NCRYPT_KEY_SPEC)
+            ret = FALSE;
         if (ret)
         {
             *phCryptProv = keyContext.hCryptProv;
