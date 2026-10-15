@@ -260,8 +260,12 @@ static void serial_queue_async( struct fd *fd, struct async *async, int type, in
     switch (type)
     {
     case ASYNC_TYPE_READ:
-        timeout = serial->timeouts.ReadTotalTimeoutConstant +
-            (timeout_t)serial->timeouts.ReadTotalTimeoutMultiplier * count;
+        timeout = serial->timeouts.ReadTotalTimeoutConstant;
+        /* With both ReadIntervalTimeout and ReadTotalTimeoutMultiplier set to MAXDWORD, the read
+         * waits up to ReadTotalTimeoutConstant for the first byte, whatever the count. */
+        if (serial->timeouts.ReadIntervalTimeout != MAXDWORD ||
+            serial->timeouts.ReadTotalTimeoutMultiplier != MAXDWORD)
+            timeout += (timeout_t)serial->timeouts.ReadTotalTimeoutMultiplier * count;
         break;
     case ASYNC_TYPE_WRITE:
         timeout = serial->timeouts.WriteTotalTimeoutConstant +

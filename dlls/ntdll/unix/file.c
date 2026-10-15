@@ -5874,6 +5874,15 @@ struct io_timeouts
     int end_time;   /* absolute time of end of operation */
 };
 
+/* With ReadIntervalTimeout and ReadTotalTimeoutMultiplier both MAXDWORD and a constant between
+ * them, a serial read returns the bytes already received, or else waits up to the constant for
+ * the first bytes and returns those. */
+static BOOL serial_read_returns_first_bytes( const SERIAL_TIMEOUTS *st )
+{
+    return st->ReadIntervalTimeout == MAXDWORD && st->ReadTotalTimeoutMultiplier == MAXDWORD &&
+           st->ReadTotalTimeoutConstant && st->ReadTotalTimeoutConstant != MAXDWORD;
+}
+
 /* retrieve the I/O timeouts to use for a given handle */
 static unsigned int get_io_timeouts( HANDLE handle, enum server_fd_type type, ULONG count, BOOL is_read,
                                      struct io_timeouts *timeouts )
@@ -5895,7 +5904,12 @@ static unsigned int get_io_timeouts( HANDLE handle, enum server_fd_type type, UL
             if (st.ReadIntervalTimeout)
                 timeouts->interval = st.ReadIntervalTimeout;
 
-            if (st.ReadTotalTimeoutMultiplier || st.ReadTotalTimeoutConstant)
+            if (serial_read_returns_first_bytes( &st ))
+            {
+                timeouts->interval = 0;
+                timeouts->total = st.ReadTotalTimeoutConstant;
+            }
+            else if (st.ReadTotalTimeoutMultiplier || st.ReadTotalTimeoutConstant)
             {
                 timeouts->total = st.ReadTotalTimeoutConstant;
                 if (st.ReadTotalTimeoutMultiplier != MAXDWORD)
@@ -5961,7 +5975,8 @@ static NTSTATUS get_io_avail_mode( HANDLE handle, enum server_fd_type type, BOOL
         {
             *avail_mode = (!st.ReadTotalTimeoutMultiplier &&
                            !st.ReadTotalTimeoutConstant &&
-                           st.ReadIntervalTimeout == MAXDWORD);
+                           st.ReadIntervalTimeout == MAXDWORD) ||
+                          serial_read_returns_first_bytes( &st );
         }
         break;
     }
