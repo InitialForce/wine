@@ -7588,24 +7588,20 @@ static void test_ipv6only(void)
     v4 = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     ok(v4 != INVALID_SOCKET, "Could not create IPv4 socket (LastError: %d)\n", WSAGetLastError());
 
-todo_wine {
     enabled = 2;
     ret = getsockopt(v4, IPPROTO_IPV6, IPV6_V6ONLY, (char*)&enabled, &len);
     ok(!ret, "getsockopt(IPV6_V6ONLY) failed (LastError: %d)\n", WSAGetLastError());
     ok(enabled == 1, "expected 1, got %d\n", enabled);
-}
 
     enabled = 0;
     len = sizeof(enabled);
     ret = setsockopt(v4, IPPROTO_IPV6, IPV6_V6ONLY, (char*)&enabled, len);
     ok(!ret, "setsockopt(IPV6_V6ONLY) failed (LastError: %d)\n", WSAGetLastError());
 
-todo_wine {
     enabled = 2;
     ret = getsockopt(v4, IPPROTO_IPV6, IPV6_V6ONLY, (char*)&enabled, &len);
     ok(!ret, "getsockopt(IPV6_V6ONLY) failed (LastError: %d)\n", WSAGetLastError());
     ok(!enabled, "expected 0, got %d\n", enabled);
-}
 
     enabled = 1;
     len = sizeof(enabled);
@@ -7616,24 +7612,20 @@ todo_wine {
     ret = bind(v4, (struct sockaddr*)&sin4, sizeof(sin4));
     ok(!ret, "Could not bind IPv4 address (LastError: %d)\n", WSAGetLastError());
 
-todo_wine {
     enabled = 2;
     ret = getsockopt(v4, IPPROTO_IPV6, IPV6_V6ONLY, (char*)&enabled, &len);
     ok(!ret, "getsockopt(IPV6_V6ONLY) failed (LastError: %d)\n", WSAGetLastError());
     ok(enabled == 1, "expected 1, got %d\n", enabled);
-}
 
     enabled = 0;
     len = sizeof(enabled);
     ret = setsockopt(v4, IPPROTO_IPV6, IPV6_V6ONLY, (char*)&enabled, len);
     ok(ret, "setsockopt(IPV6_V6ONLY) succeeded (LastError: %d)\n", WSAGetLastError());
 
-todo_wine {
     enabled = 0;
     ret = getsockopt(v4, IPPROTO_IPV6, IPV6_V6ONLY, (char*)&enabled, &len);
     ok(!ret, "getsockopt(IPV6_V6ONLY) failed (LastError: %d)\n", WSAGetLastError());
     ok(enabled == 1, "expected 1, got %d\n", enabled);
-}
 
     enabled = 1;
     len = sizeof(enabled);
@@ -7642,6 +7634,21 @@ todo_wine {
 
     closesocket(v4);
     closesocket(v6);
+
+    v4 = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ok(v4 != INVALID_SOCKET, "Could not create IPv4 socket (LastError: %d)\n", WSAGetLastError());
+
+    sin4.sin_port = 0;
+    ret = bind(v4, (struct sockaddr*)&sin4, sizeof(sin4));
+    ok(!ret, "Could not bind IPv4 address (LastError: %d)\n", WSAGetLastError());
+
+    enabled = 2;
+    len = sizeof(enabled);
+    ret = getsockopt(v4, IPPROTO_IPV6, IPV6_V6ONLY, (char*)&enabled, &len);
+    ok(!ret, "getsockopt(IPV6_V6ONLY) failed (LastError: %d)\n", WSAGetLastError());
+    ok(enabled == 1, "expected 1, got %d\n", enabled);
+
+    closesocket(v4);
 
     /* Test again, this time disabling IPV6_V6ONLY. */
     sin4.sin_port = htons(SERVERPORT+2);

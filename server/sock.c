@@ -298,6 +298,7 @@ struct sock
     unsigned int        reset : 1;   /* did we get a TCP reset? */
     unsigned int        reuseaddr : 1; /* winsock SO_REUSEADDR option value */
     unsigned int        exclusiveaddruse : 1; /* winsock SO_EXCLUSIVEADDRUSE option value */
+    unsigned int        ipv4_v6only : 1; /* winsock IPV6_V6ONLY option value of an IPv4 socket */
 };
 
 static int is_tcp_socket( struct sock *sock )
@@ -1795,6 +1796,7 @@ static struct sock *create_socket(void)
     sock->reset = 0;
     sock->reuseaddr = 0;
     sock->exclusiveaddruse = 0;
+    sock->ipv4_v6only = 1;
     sock->rcvbuf = 0;
     sock->sndbuf = 0;
     sock->rcvtimeo = 0;
@@ -3499,6 +3501,70 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
 
         exclusive = sock->exclusiveaddruse;
         set_reply_data( &exclusive, min( sizeof(exclusive), get_reply_max_size() ));
+        return;
+    }
+
+    /* An IPv4 socket on Windows has an IPV6_V6ONLY value: 1 at first, which can be changed until
+     * the socket is bound. A Unix IPv4 socket has no such option, so the value is kept here. */
+    case IOCTL_AFD_WINE_GET_IPV6_V6ONLY:
+    {
+        int v6only;
+
+        if (!get_reply_max_size())
+        {
+            set_error( STATUS_BUFFER_TOO_SMALL );
+            return;
+        }
+
+        if (sock->family == WS_AF_INET)
+            v6only = sock->ipv4_v6only;
+        else
+        {
+#ifdef IPV6_V6ONLY
+            socklen_t len = sizeof(v6only);
+
+            if (getsockopt( unix_fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, &len ))
+            {
+                set_error( sock_get_ntstatus( errno ) );
+                return;
+            }
+#else
+            set_error( STATUS_NOT_SUPPORTED );
+            return;
+#endif
+        }
+
+        set_reply_data( &v6only, min( sizeof(v6only), get_reply_max_size() ));
+        return;
+    }
+
+    case IOCTL_AFD_WINE_SET_IPV6_V6ONLY:
+    {
+        int v6only;
+
+        if (get_req_data_size() < sizeof(v6only))
+        {
+            set_error( STATUS_BUFFER_TOO_SMALL );
+            return;
+        }
+
+        v6only = *(int *)get_req_data();
+
+        if (sock->family == WS_AF_INET)
+        {
+            if (sock->bound)
+                set_error( STATUS_INVALID_PARAMETER );
+            else
+                sock->ipv4_v6only = !!v6only;
+            return;
+        }
+
+#ifdef IPV6_V6ONLY
+        if (setsockopt( unix_fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only) ))
+            set_error( sock_get_ntstatus( errno ) );
+#else
+        set_error( STATUS_NOT_SUPPORTED );
+#endif
         return;
     }
 
