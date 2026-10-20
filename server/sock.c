@@ -2105,6 +2105,7 @@ static struct sock *accept_socket( struct sock *sock )
         acceptsock->message             = sock->message;
         acceptsock->reuseaddr           = sock->reuseaddr;
         acceptsock->exclusiveaddruse    = sock->exclusiveaddruse;
+        acceptsock->ipv4_v6only         = sock->ipv4_v6only;
         acceptsock->sndbuf              = sock->sndbuf;
         acceptsock->rcvbuf              = sock->rcvbuf;
         acceptsock->sndtimeo            = sock->sndtimeo;
@@ -3552,10 +3553,14 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
 
         if (sock->family == WS_AF_INET)
         {
-            if (sock->bound)
-                set_error( STATUS_INVALID_PARAMETER );
-            else
+            union unix_sockaddr addr;
+            socklen_t len = sizeof(addr);
+
+            /* Ask the Unix socket: a failed connect() can bind it without setting sock->bound. */
+            if (!getsockname( unix_fd, &addr.addr, &len ) && addr.addr.sa_family == AF_INET && !addr.in.sin_port)
                 sock->ipv4_v6only = !!v6only;
+            else
+                set_error( STATUS_INVALID_PARAMETER );
             return;
         }
 
