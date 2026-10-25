@@ -1664,12 +1664,12 @@ void server_init_process( struct thread_data *data )
                                version, SERVER_PROTOCOL_VERSION,
                                (version > SERVER_PROTOCOL_VERSION) ? "wine" : "wineserver" );
 #if defined(__linux__) && defined(HAVE_PRCTL)
-    /* work around Ubuntu's ptrace breakage; WINE_ALLOW_PTRACE lets any process of the same user
+    /* work around Ubuntu's ptrace breakage; WINE_ALLOW_PTRACE=1 lets any process of the same user
      * attach, so gdb can read the stacks of a process whose loader lock is held */
     {
         const char *allow_ptrace = getenv( "WINE_ALLOW_PTRACE" );
 
-        if (allow_ptrace && *allow_ptrace && strcmp( allow_ptrace, "0" ))
+        if (allow_ptrace && !strcmp( allow_ptrace, "1" ))
             prctl( 0x59616d61 /* PR_SET_PTRACER */, (unsigned long)-1 /* PR_SET_PTRACER_ANY */ );
         else if (server_pid != -1) prctl( 0x59616d61 /* PR_SET_PTRACER */, server_pid );
     }
