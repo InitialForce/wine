@@ -867,6 +867,18 @@ static void check_ecdsa_p256_properties(NCRYPT_KEY_HANDLE key)
     ok(length == 256, "got %lu\n", length);
 }
 
+static void check_import_fails(NCRYPT_PROV_HANDLE prov, const WCHAR *type, NCryptBufferDesc *params, BYTE *blob,
+                               DWORD size, const char *what)
+{
+    NCRYPT_KEY_HANDLE imported = 0;
+    SECURITY_STATUS ret;
+
+    ret = NCryptImportKey(prov, 0, type, params, &imported, blob, size, 0);
+    ok(ret == NTE_INVALID_PARAMETER || broken(ret != ERROR_SUCCESS), "%s: got %#lx\n", what, ret);
+    ok(!imported, "%s: got a key\n", what);
+    if (imported) NCryptFreeObject(imported);
+}
+
 static void test_ecdsa_p256_key(void)
 {
     NCRYPT_PROV_HANDLE prov;
@@ -927,12 +939,32 @@ static void test_ecdsa_p256_key(void)
     check_ecdsa_p256_properties(imported);
     NCryptFreeObject(imported);
 
+    /* A malformed curve name buffer is rejected. */
+    curve_buffer.cbBuffer = sizeof(L"nistP256") - sizeof(WCHAR);
+    check_import_fails(prov, BCRYPT_ECCPRIVATE_BLOB, &curve_params, blob, size, "unterminated name");
+    curve_buffer.cbBuffer = 0;
+    check_import_fails(prov, BCRYPT_ECCPRIVATE_BLOB, &curve_params, blob, size, "zero length");
+    curve_buffer.cbBuffer = sizeof(L"nistP256") - 1;
+    check_import_fails(prov, BCRYPT_ECCPRIVATE_BLOB, &curve_params, blob, size, "odd length");
+    curve_buffer.cbBuffer = sizeof(L"nistP256");
+    curve_params.ulVersion = BCRYPTBUFFER_VERSION + 1;
+    check_import_fails(prov, BCRYPT_ECCPRIVATE_BLOB, &curve_params, blob, size, "wrong version");
+    curve_params.ulVersion = BCRYPTBUFFER_VERSION;
+
+    /* An ECC blob is accepted only under the blob type that matches its magic. */
+    check_import_fails(prov, BCRYPT_RSAPUBLIC_BLOB, NULL, blob, size, "private P-256 blob as RSAPUBLICBLOB");
+    check_import_fails(prov, BCRYPT_ECCPUBLIC_BLOB, NULL, blob, size, "private P-256 blob as ECCPUBLICBLOB");
+    check_import_fails(prov, NULL, NULL, blob, size, "private P-256 blob without a type");
+
     header->dwMagic = BCRYPT_ECDSA_PRIVATE_GENERIC_MAGIC;
     imported = 0;
     ret = NCryptImportKey(prov, 0, BCRYPT_ECCPRIVATE_BLOB, &curve_params, &imported, blob, size, 0);
     ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
     check_ecdsa_p256_properties(imported);
     NCryptFreeObject(imported);
+
+    check_import_fails(prov, BCRYPT_RSAPUBLIC_BLOB, &curve_params, blob, size, "generic blob as RSAPUBLICBLOB");
+    check_import_fails(prov, BCRYPT_ECCPUBLIC_BLOB, &curve_params, blob, size, "generic private blob as ECCPUBLICBLOB");
 
     NCryptFreeObject(key);
     NCryptFreeObject(prov);

@@ -182,6 +182,23 @@ static struct object *create_key_object(enum algid algid, NCRYPT_PROV_HANDLE pro
     return object;
 }
 
+/* Releases the properties, and the provider reference a key holds, then the object itself. */
+static void free_object(struct object *object)
+{
+    unsigned int i;
+
+    for (i = 0; i < object->num_properties; i++)
+    {
+        if (!wcscmp(object->properties[i].key, NCRYPT_PROVIDER_HANDLE_PROPERTY))
+            NCryptFreeObject(*(NCRYPT_HANDLE *)object->properties[i].value);
+
+        free(object->properties[i].key);
+        free(object->properties[i].value);
+    }
+    free(object->properties);
+    free(object);
+}
+
 SECURITY_STATUS WINAPI NCryptCreatePersistedKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_HANDLE *key,
                                                 const WCHAR *algid, const WCHAR *name, DWORD keyspec, DWORD flags)
 {
@@ -209,7 +226,7 @@ SECURITY_STATUS WINAPI NCryptCreatePersistedKey(NCRYPT_PROV_HANDLE provider, NCR
         if (status != STATUS_SUCCESS)
         {
             ERR("Error generating key pair %#lx\n", status);
-            free(object);
+            free_object(object);
             return map_ntstatus(status);
         }
 
@@ -227,7 +244,7 @@ SECURITY_STATUS WINAPI NCryptCreatePersistedKey(NCRYPT_PROV_HANDLE provider, NCR
         status = BCryptGenerateKeyPair(BCRYPT_ECDSA_P256_ALG_HANDLE, &object->key.bcrypt_key, bitlen, 0);
         if (status != STATUS_SUCCESS)
         {
-            free(object);
+            free_object(object);
             return map_ntstatus(status);
         }
 
@@ -344,7 +361,6 @@ SECURITY_STATUS WINAPI NCryptFreeObject(NCRYPT_HANDLE handle)
 {
     struct object *object = (struct object *)handle;
     SECURITY_STATUS ret = STATUS_SUCCESS;
-    unsigned int i;
 
     TRACE("(%#Ix)\n", handle);
 
@@ -371,16 +387,7 @@ SECURITY_STATUS WINAPI NCryptFreeObject(NCRYPT_HANDLE handle)
         return NTE_INVALID_HANDLE;
     }
 
-    for (i = 0; i < object->num_properties; i++)
-    {
-        if (!wcscmp(object->properties[i].key, NCRYPT_PROVIDER_HANDLE_PROPERTY))
-            NCryptFreeObject(*(NCRYPT_HANDLE *)object->properties[i].value);
-
-        free(object->properties[i].key);
-        free(object->properties[i].value);
-    }
-    free(object->properties);
-    free(object);
+    free_object(object);
     return ret;
 }
 
@@ -406,21 +413,35 @@ SECURITY_STATUS WINAPI NCryptGetProperty(NCRYPT_HANDLE handle, const WCHAR *name
     return ERROR_SUCCESS;
 }
 
-/* .NET's ECDsaCng.ImportParameters passes the curve name of a named-curve key as the only parameter. */
-static BOOL params_name_p256_curve(const NCryptBufferDesc *params)
+/* .NET's ECDsaCng.ImportParameters passes the curve name of a named-curve key as the only parameter.
+ * Returns NTE_INVALID_PARAMETER for a malformed descriptor and NTE_NOT_SUPPORTED for anything but a P-256 name. */
+static SECURITY_STATUS check_p256_curve_params(const NCryptBufferDesc *params)
 {
-    ULONG i;
+    ULONG i, j;
 
-    if (!params->cBuffers || !params->pBuffers) return FALSE;
+    if (params->ulVersion != NCRYPTBUFFER_VERSION) return NTE_INVALID_PARAMETER;
+    if (params->cBuffers && !params->pBuffers) return NTE_INVALID_PARAMETER;
+    if (!params->cBuffers) return NTE_NOT_SUPPORTED;
     for (i = 0; i < params->cBuffers; i++)
     {
         const NCryptBuffer *buffer = &params->pBuffers[i];
         const WCHAR *name = buffer->pvBuffer;
 
-        if (buffer->BufferType != NCRYPTBUFFER_ECC_CURVE_NAME || !name) return FALSE;
-        if (lstrcmpiW(name, BCRYPT_ECC_CURVE_NISTP256) && lstrcmpiW(name, BCRYPT_ECC_CURVE_SECP256R1)) return FALSE;
+        if (buffer->BufferType != NCRYPTBUFFER_ECC_CURVE_NAME) return NTE_NOT_SUPPORTED;
+        if (!name || !buffer->cbBuffer || buffer->cbBuffer % sizeof(WCHAR)) return NTE_INVALID_PARAMETER;
+        for (j = 0; j < buffer->cbBuffer / sizeof(WCHAR); j++) if (!name[j]) break;
+        if (j == buffer->cbBuffer / sizeof(WCHAR)) return NTE_INVALID_PARAMETER;
+        if (lstrcmpiW(name, BCRYPT_ECC_CURVE_NISTP256) && lstrcmpiW(name, BCRYPT_ECC_CURVE_SECP256R1))
+            return NTE_NOT_SUPPORTED;
     }
-    return TRUE;
+    return ERROR_SUCCESS;
+}
+
+/* An ECC blob is accepted only under the blob type that matches its magic. */
+static BOOL ecc_blob_type_matches(const WCHAR *type, BOOL private)
+{
+    if (!type) return FALSE;
+    return !wcscmp(type, private ? BCRYPT_ECCPRIVATE_BLOB : BCRYPT_ECCPUBLIC_BLOB);
 }
 
 static SECURITY_STATUS import_ecdsa_p256(NCRYPT_PROV_HANDLE provider, BOOL private, BYTE *data, DWORD datasize,
@@ -442,7 +463,7 @@ static SECURITY_STATUS import_ecdsa_p256(NCRYPT_PROV_HANDLE provider, BOOL priva
     if (status != STATUS_SUCCESS)
     {
         WARN("Error importing key pair %#lx\n", status);
-        free(object);
+        free_object(object);
         return map_ntstatus(status);
     }
 
@@ -458,6 +479,7 @@ SECURITY_STATUS WINAPI NCryptImportKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_H
 {
     BCRYPT_KEY_BLOB *header = (BCRYPT_KEY_BLOB *)data;
     struct object *object;
+    SECURITY_STATUS params_status;
 
     TRACE("(%#Ix, %#Ix, %s, %p, %p, %p, %lu, %#lx)\n", provider, decrypt_key, wine_dbgstr_w(type),
           params, handle, data, datasize, flags);
@@ -467,10 +489,11 @@ SECURITY_STATUS WINAPI NCryptImportKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_H
         FIXME("Key blob decryption not implemented\n");
         return NTE_NOT_SUPPORTED;
     }
-    if (params && !params_name_p256_curve(params))
+    if (params && (params_status = check_p256_curve_params(params)))
     {
-        FIXME("Parameter information not implemented\n");
-        return NTE_NOT_SUPPORTED;
+        if (params_status == NTE_NOT_SUPPORTED) FIXME("Parameter information not implemented\n");
+        else WARN("Invalid parameters\n");
+        return params_status;
     }
     if (flags == NCRYPT_SILENT_FLAG)
     {
@@ -507,7 +530,7 @@ SECURITY_STATUS WINAPI NCryptImportKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_H
         if (status != STATUS_SUCCESS)
         {
             WARN("Error importing key pair %#lx\n", status);
-            free(object);
+            free_object(object);
             return map_ntstatus(status);
         }
 
@@ -518,8 +541,15 @@ SECURITY_STATUS WINAPI NCryptImportKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_H
     case BCRYPT_ECDSA_PRIVATE_P256_MAGIC:
     case BCRYPT_ECDSA_PUBLIC_P256_MAGIC:
     {
-        SECURITY_STATUS ret = import_ecdsa_p256(provider, header->Magic == BCRYPT_ECDSA_PRIVATE_P256_MAGIC, data,
-                                                datasize, &object);
+        BOOL private = header->Magic == BCRYPT_ECDSA_PRIVATE_P256_MAGIC;
+        SECURITY_STATUS ret;
+
+        if (!ecc_blob_type_matches(type, private))
+        {
+            WARN("Blob type %s does not match magic %#lx\n", wine_dbgstr_w(type), header->Magic);
+            return NTE_INVALID_PARAMETER;
+        }
+        ret = import_ecdsa_p256(provider, private, data, datasize, &object);
         if (ret != ERROR_SUCCESS) return ret;
         break;
     }
@@ -531,6 +561,11 @@ SECURITY_STATUS WINAPI NCryptImportKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_H
         SECURITY_STATUS ret;
         BOOL private = header->Magic == BCRYPT_ECDSA_PRIVATE_GENERIC_MAGIC;
 
+        if (!ecc_blob_type_matches(type, private))
+        {
+            WARN("Blob type %s does not match magic %#lx\n", wine_dbgstr_w(type), header->Magic);
+            return NTE_INVALID_PARAMETER;
+        }
         if (!params || datasize < sizeof(*copy) || ((BCRYPT_ECCKEY_BLOB *)data)->cbKey != 32)
         {
             FIXME("Unsupported generic ECDSA key\n");
