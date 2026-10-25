@@ -840,8 +840,85 @@ static void test_NCryptExportKey(void)
     NCryptFreeObject(prov);
 }
 
+static void check_ecdsa_p256_properties(NCRYPT_KEY_HANDLE key)
+{
+    WCHAR name[32];
+    DWORD size, length;
+    SECURITY_STATUS ret;
+
+    size = 0;
+    memset(name, 0, sizeof(name));
+    ret = NCryptGetProperty(key, NCRYPT_ALGORITHM_PROPERTY, (BYTE *)name, sizeof(name), &size, 0);
+    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
+    ok(size == sizeof(L"ECDSA_P256"), "got %lu\n", size);
+    ok(!lstrcmpW(name, L"ECDSA_P256"), "got %s\n", wine_dbgstr_w(name));
+
+    size = 0;
+    memset(name, 0, sizeof(name));
+    ret = NCryptGetProperty(key, NCRYPT_ALGORITHM_GROUP_PROPERTY, (BYTE *)name, sizeof(name), &size, 0);
+    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
+    ok(size == sizeof(L"ECDSA"), "got %lu\n", size);
+    ok(!lstrcmpW(name, L"ECDSA"), "got %s\n", wine_dbgstr_w(name));
+
+    size = 0;
+    length = 0;
+    ret = NCryptGetProperty(key, NCRYPT_LENGTH_PROPERTY, (BYTE *)&length, sizeof(length), &size, 0);
+    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
+    ok(length == 256, "got %lu\n", length);
+}
+
+static void test_ecdsa_p256_key(void)
+{
+    NCRYPT_PROV_HANDLE prov;
+    NCRYPT_KEY_HANDLE key, imported;
+    SECURITY_STATUS ret;
+    DWORD size, policy;
+    BYTE blob[256];
+    BCRYPT_ECCKEY_BLOB *header = (BCRYPT_ECCKEY_BLOB *)blob;
+
+    ret = NCryptOpenStorageProvider(&prov, NULL, 0);
+    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
+
+    ret = NCryptCreatePersistedKey(prov, &key, BCRYPT_ECDSA_P256_ALGORITHM, NULL, 0, 0);
+    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
+    policy = NCRYPT_ALLOW_EXPORT_FLAG | NCRYPT_ALLOW_PLAINTEXT_EXPORT_FLAG;
+    ret = NCryptSetProperty(key, NCRYPT_EXPORT_POLICY_PROPERTY, (BYTE *)&policy, sizeof(policy), 0);
+    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
+    ret = NCryptFinalizeKey(key, 0);
+    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
+    check_ecdsa_p256_properties(key);
+
+    size = 0;
+    ret = NCryptExportKey(key, 0, BCRYPT_ECCPUBLIC_BLOB, NULL, blob, sizeof(blob), &size, 0);
+    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
+    ok(size == sizeof(*header) + 2 * 32, "got %lu\n", size);
+    ok(header->dwMagic == BCRYPT_ECDSA_PUBLIC_P256_MAGIC, "got %#lx\n", header->dwMagic);
+
+    imported = 0;
+    ret = NCryptImportKey(prov, 0, BCRYPT_ECCPUBLIC_BLOB, NULL, &imported, blob, size, 0);
+    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
+    check_ecdsa_p256_properties(imported);
+    NCryptFreeObject(imported);
+
+    size = 0;
+    ret = NCryptExportKey(key, 0, BCRYPT_ECCPRIVATE_BLOB, NULL, blob, sizeof(blob), &size, 0);
+    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
+    ok(size == sizeof(*header) + 3 * 32, "got %lu\n", size);
+    ok(header->dwMagic == BCRYPT_ECDSA_PRIVATE_P256_MAGIC, "got %#lx\n", header->dwMagic);
+
+    imported = 0;
+    ret = NCryptImportKey(prov, 0, BCRYPT_ECCPRIVATE_BLOB, NULL, &imported, blob, size, 0);
+    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
+    check_ecdsa_p256_properties(imported);
+    NCryptFreeObject(imported);
+
+    NCryptFreeObject(key);
+    NCryptFreeObject(prov);
+}
+
 START_TEST(ncrypt)
 {
+    test_ecdsa_p256_key();
     test_key_import_rsa();
     test_free_object();
     test_get_property();

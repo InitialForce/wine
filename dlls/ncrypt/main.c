@@ -160,6 +160,10 @@ static struct object *create_key_object(enum algid algid, NCRYPT_PROV_HANDLE pro
         if (!(object = allocate_object(KEY))) return NULL;
 
         object->key.algid = ECDSA_P256;
+        set_object_property(object, NCRYPT_ALGORITHM_PROPERTY, (BYTE *)BCRYPT_ECDSA_P256_ALGORITHM,
+                            sizeof(BCRYPT_ECDSA_P256_ALGORITHM));
+        set_object_property(object, NCRYPT_ALGORITHM_GROUP_PROPERTY, (BYTE *)NCRYPT_ECDSA_ALGORITHM_GROUP,
+                            sizeof(NCRYPT_ECDSA_ALGORITHM_GROUP));
         break;
 
     default:
@@ -458,6 +462,33 @@ SECURITY_STATUS WINAPI NCryptImportKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_H
 
         set_object_property(object, NCRYPT_LENGTH_PROPERTY, (BYTE *)&rsablob->BitLength, sizeof(rsablob->BitLength));
         set_object_property(object, BCRYPT_PUBLIC_KEY_LENGTH, (BYTE *)&rsablob->BitLength, sizeof(rsablob->BitLength));
+        break;
+    }
+    case BCRYPT_ECDSA_PRIVATE_P256_MAGIC:
+    case BCRYPT_ECDSA_PUBLIC_P256_MAGIC:
+    {
+        NTSTATUS status;
+        DWORD bitlen = 256;
+        const WCHAR *blob_type = header->Magic == BCRYPT_ECDSA_PRIVATE_P256_MAGIC ? BCRYPT_ECCPRIVATE_BLOB
+                                                                                   : BCRYPT_ECCPUBLIC_BLOB;
+
+        if (!(object = create_key_object(ECDSA_P256, provider)))
+        {
+            ERR("Error allocating memory\n");
+            return NTE_NO_MEMORY;
+        }
+
+        status = BCryptImportKeyPair(BCRYPT_ECDSA_P256_ALG_HANDLE, NULL, blob_type, &object->key.bcrypt_key, data,
+                                     datasize, 0);
+        if (status != STATUS_SUCCESS)
+        {
+            WARN("Error importing key pair %#lx\n", status);
+            free(object);
+            return map_ntstatus(status);
+        }
+
+        set_object_property(object, NCRYPT_LENGTH_PROPERTY, (BYTE *)&bitlen, sizeof(bitlen));
+        set_object_property(object, BCRYPT_PUBLIC_KEY_LENGTH, (BYTE *)&bitlen, sizeof(bitlen));
         break;
     }
     default:
