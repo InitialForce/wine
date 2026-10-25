@@ -5589,9 +5589,9 @@ static void test_exclusive_root_without_exclusive_flags(void)
     config.cbSize = FIELD_OFFSET(CERT_CHAIN_ENGINE_CONFIG, dwExclusiveFlags);
     config.hExclusiveRoot = root;
     ret = CertCreateCertificateChainEngine(&config, &engine);
+    ok(ret, "CertCreateCertificateChainEngine failed: %08lx\n", GetLastError());
     if (!ret)
     {
-        win_skip("hExclusiveRoot is not supported\n");
         CertFreeCertificateContext(leaf);
         CertCloseStore(root, 0);
         return;
@@ -5614,9 +5614,91 @@ static void test_exclusive_root_without_exclusive_flags(void)
     CertCloseStore(root, 0);
 }
 
+/* Builds a chain for cert with an engine whose only trusted root store is the given exclusive store. */
+static DWORD get_exclusive_chain_error(HCERTSTORE exclusive, PCCERT_CONTEXT cert, const FILETIME *time)
+{
+    CERT_CHAIN_ENGINE_CONFIG config = { 0 };
+    CERT_CHAIN_PARA para = { sizeof(para) };
+    PCCERT_CHAIN_CONTEXT chain;
+    HCERTCHAINENGINE engine;
+    DWORD error;
+    BOOL ret;
+
+    config.cbSize = FIELD_OFFSET(CERT_CHAIN_ENGINE_CONFIG, dwExclusiveFlags);
+    config.hExclusiveRoot = exclusive;
+    ret = CertCreateCertificateChainEngine(&config, &engine);
+    ok(ret, "CertCreateCertificateChainEngine failed: %08lx\n", GetLastError());
+    if (!ret) return 0;
+
+    ret = CertGetCertificateChain(engine, cert, (FILETIME *)time, NULL, &para, 0, NULL, &chain);
+    ok(ret, "CertGetCertificateChain failed: %08lx\n", GetLastError());
+    error = ret ? chain->TrustStatus.dwErrorStatus : 0;
+    if (ret) CertFreeCertificateChain(chain);
+    CertFreeCertificateChainEngine(engine);
+    return error;
+}
+
+/* A root outside the exclusive store is not trusted, even when the system trusts it. */
+static void test_exclusive_root_rejects_other_roots(void)
+{
+    CERT_CHAIN_ENGINE_CONFIG config = { 0 };
+    HCERTCHAINENGINE engine;
+    PCCERT_CONTEXT leaf, system_root;
+    HCERTSTORE empty, unrelated, system;
+    FILETIME time;
+    DWORD error;
+    BOOL ret;
+
+    empty = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
+    unrelated = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
+    ret = CertAddEncodedCertificateToStore(unrelated, X509_ASN_ENCODING, chain0_0, sizeof(chain0_0),
+                                           CERT_STORE_ADD_ALWAYS, NULL);
+    ok(ret, "CertAddEncodedCertificateToStore failed: %08lx\n", GetLastError());
+    leaf = CertCreateCertificateContext(X509_ASN_ENCODING, chain0_1, sizeof(chain0_1));
+    ok(leaf != NULL, "CertCreateCertificateContext failed: %08lx\n", GetLastError());
+
+    /* An empty exclusive store trusts nothing. */
+    SystemTimeToFileTime(&oct2007, &time);
+    error = get_exclusive_chain_error(empty, leaf, &time);
+    ok(error & (CERT_TRUST_IS_PARTIAL_CHAIN | CERT_TRUST_IS_UNTRUSTED_ROOT), "got error status %08lx\n", error);
+
+    /* A root from the system Root store, chained under an exclusive store that does not hold it. */
+    system = CertOpenSystemStoreW(0, L"Root");
+    system_root = system ? CertEnumCertificatesInStore(system, NULL) : NULL;
+    if (system_root)
+    {
+        error = get_exclusive_chain_error(unrelated, system_root, NULL);
+        ok(error & CERT_TRUST_IS_UNTRUSTED_ROOT, "got error status %08lx\n", error);
+        CertFreeCertificateContext(system_root);
+    }
+    else skip("no certificate in the system Root store\n");
+    if (system) CertCloseStore(system, 0);
+
+    /* Sizes other than the three known config layouts are refused. */
+    config.hExclusiveRoot = unrelated;
+    config.cbSize = FIELD_OFFSET(CERT_CHAIN_ENGINE_CONFIG, hExclusiveTrustedPeople);
+    SetLastError(0xdeadbeef);
+    engine = NULL;
+    ret = CertCreateCertificateChainEngine(&config, &engine);
+    ok(!ret && GetLastError() == E_INVALIDARG, "size %lu: got %d, error %08lx\n", config.cbSize, ret, GetLastError());
+    if (ret) CertFreeCertificateChainEngine(engine);
+
+    config.cbSize = FIELD_OFFSET(CERT_CHAIN_ENGINE_CONFIG, hExclusiveRoot) - sizeof(DWORD);
+    SetLastError(0xdeadbeef);
+    engine = NULL;
+    ret = CertCreateCertificateChainEngine(&config, &engine);
+    ok(!ret && GetLastError() == E_INVALIDARG, "size %lu: got %d, error %08lx\n", config.cbSize, ret, GetLastError());
+    if (ret) CertFreeCertificateChainEngine(engine);
+
+    CertFreeCertificateContext(leaf);
+    CertCloseStore(unrelated, 0);
+    CertCloseStore(empty, 0);
+}
+
 START_TEST(chain)
 {
     test_exclusive_root_without_exclusive_flags();
+    test_exclusive_root_rejects_other_roots();
     testCreateCertChainEngine();
     testVerifyCertChainPolicy();
     testGetCertChain();
