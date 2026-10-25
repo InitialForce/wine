@@ -875,6 +875,8 @@ static void test_ecdsa_p256_key(void)
     DWORD size, policy;
     BYTE blob[256];
     BCRYPT_ECCKEY_BLOB *header = (BCRYPT_ECCKEY_BLOB *)blob;
+    NCryptBuffer curve_buffer;
+    NCryptBufferDesc curve_params;
 
     ret = NCryptOpenStorageProvider(&prov, NULL, 0);
     ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
@@ -908,6 +910,26 @@ static void test_ecdsa_p256_key(void)
 
     imported = 0;
     ret = NCryptImportKey(prov, 0, BCRYPT_ECCPRIVATE_BLOB, NULL, &imported, blob, size, 0);
+    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
+    check_ecdsa_p256_properties(imported);
+    NCryptFreeObject(imported);
+
+    /* .NET's ECDsaCng.ImportParameters names the curve in the parameters. */
+    curve_buffer.cbBuffer = sizeof(L"nistP256");
+    curve_buffer.BufferType = NCRYPTBUFFER_ECC_CURVE_NAME;
+    curve_buffer.pvBuffer = (void *)L"nistP256";
+    curve_params.ulVersion = BCRYPTBUFFER_VERSION;
+    curve_params.cBuffers = 1;
+    curve_params.pBuffers = &curve_buffer;
+    imported = 0;
+    ret = NCryptImportKey(prov, 0, BCRYPT_ECCPRIVATE_BLOB, &curve_params, &imported, blob, size, 0);
+    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
+    check_ecdsa_p256_properties(imported);
+    NCryptFreeObject(imported);
+
+    header->dwMagic = BCRYPT_ECDSA_PRIVATE_GENERIC_MAGIC;
+    imported = 0;
+    ret = NCryptImportKey(prov, 0, BCRYPT_ECCPRIVATE_BLOB, &curve_params, &imported, blob, size, 0);
     ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
     check_ecdsa_p256_properties(imported);
     NCryptFreeObject(imported);

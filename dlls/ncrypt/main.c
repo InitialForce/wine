@@ -406,6 +406,52 @@ SECURITY_STATUS WINAPI NCryptGetProperty(NCRYPT_HANDLE handle, const WCHAR *name
     return ERROR_SUCCESS;
 }
 
+/* .NET's ECDsaCng.ImportParameters passes the curve name of a named-curve key as the only parameter. */
+static BOOL params_name_p256_curve(const NCryptBufferDesc *params)
+{
+    ULONG i;
+
+    if (!params->cBuffers || !params->pBuffers) return FALSE;
+    for (i = 0; i < params->cBuffers; i++)
+    {
+        const NCryptBuffer *buffer = &params->pBuffers[i];
+        const WCHAR *name = buffer->pvBuffer;
+
+        if (buffer->BufferType != NCRYPTBUFFER_ECC_CURVE_NAME || !name) return FALSE;
+        if (lstrcmpiW(name, BCRYPT_ECC_CURVE_NISTP256) && lstrcmpiW(name, BCRYPT_ECC_CURVE_SECP256R1)) return FALSE;
+    }
+    return TRUE;
+}
+
+static SECURITY_STATUS import_ecdsa_p256(NCRYPT_PROV_HANDLE provider, BOOL private, BYTE *data, DWORD datasize,
+                                         struct object **ret_object)
+{
+    struct object *object;
+    NTSTATUS status;
+    DWORD bitlen = 256;
+
+    if (!(object = create_key_object(ECDSA_P256, provider)))
+    {
+        ERR("Error allocating memory\n");
+        return NTE_NO_MEMORY;
+    }
+
+    status = BCryptImportKeyPair(BCRYPT_ECDSA_P256_ALG_HANDLE, NULL,
+                                 private ? BCRYPT_ECCPRIVATE_BLOB : BCRYPT_ECCPUBLIC_BLOB,
+                                 &object->key.bcrypt_key, data, datasize, 0);
+    if (status != STATUS_SUCCESS)
+    {
+        WARN("Error importing key pair %#lx\n", status);
+        free(object);
+        return map_ntstatus(status);
+    }
+
+    set_object_property(object, NCRYPT_LENGTH_PROPERTY, (BYTE *)&bitlen, sizeof(bitlen));
+    set_object_property(object, BCRYPT_PUBLIC_KEY_LENGTH, (BYTE *)&bitlen, sizeof(bitlen));
+    *ret_object = object;
+    return ERROR_SUCCESS;
+}
+
 SECURITY_STATUS WINAPI NCryptImportKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_HANDLE decrypt_key,
                                        const WCHAR *type, NCryptBufferDesc *params, NCRYPT_KEY_HANDLE *handle,
                                        BYTE *data, DWORD datasize, DWORD flags)
@@ -421,7 +467,7 @@ SECURITY_STATUS WINAPI NCryptImportKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_H
         FIXME("Key blob decryption not implemented\n");
         return NTE_NOT_SUPPORTED;
     }
-    if (params)
+    if (params && !params_name_p256_curve(params))
     {
         FIXME("Parameter information not implemented\n");
         return NTE_NOT_SUPPORTED;
@@ -446,6 +492,11 @@ SECURITY_STATUS WINAPI NCryptImportKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_H
         NTSTATUS status;
         BCRYPT_RSAKEY_BLOB *rsablob = (BCRYPT_RSAKEY_BLOB *)data;
 
+        if (params)
+        {
+            FIXME("Parameter information not implemented\n");
+            return NTE_NOT_SUPPORTED;
+        }
         if (!(object = create_key_object(RSA, provider)))
         {
             ERR("Error allocating memory\n");
@@ -467,28 +518,30 @@ SECURITY_STATUS WINAPI NCryptImportKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_H
     case BCRYPT_ECDSA_PRIVATE_P256_MAGIC:
     case BCRYPT_ECDSA_PUBLIC_P256_MAGIC:
     {
-        NTSTATUS status;
-        DWORD bitlen = 256;
-        const WCHAR *blob_type = header->Magic == BCRYPT_ECDSA_PRIVATE_P256_MAGIC ? BCRYPT_ECCPRIVATE_BLOB
-                                                                                   : BCRYPT_ECCPUBLIC_BLOB;
+        SECURITY_STATUS ret = import_ecdsa_p256(provider, header->Magic == BCRYPT_ECDSA_PRIVATE_P256_MAGIC, data,
+                                                datasize, &object);
+        if (ret != ERROR_SUCCESS) return ret;
+        break;
+    }
+    case BCRYPT_ECDSA_PRIVATE_GENERIC_MAGIC:
+    case BCRYPT_ECDSA_PUBLIC_GENERIC_MAGIC:
+    {
+        /* A generic blob names its curve in params; only P-256 is supported. */
+        BCRYPT_ECCKEY_BLOB *copy;
+        SECURITY_STATUS ret;
+        BOOL private = header->Magic == BCRYPT_ECDSA_PRIVATE_GENERIC_MAGIC;
 
-        if (!(object = create_key_object(ECDSA_P256, provider)))
+        if (!params || datasize < sizeof(*copy) || ((BCRYPT_ECCKEY_BLOB *)data)->cbKey != 32)
         {
-            ERR("Error allocating memory\n");
-            return NTE_NO_MEMORY;
+            FIXME("Unsupported generic ECDSA key\n");
+            return NTE_NOT_SUPPORTED;
         }
-
-        status = BCryptImportKeyPair(BCRYPT_ECDSA_P256_ALG_HANDLE, NULL, blob_type, &object->key.bcrypt_key, data,
-                                     datasize, 0);
-        if (status != STATUS_SUCCESS)
-        {
-            WARN("Error importing key pair %#lx\n", status);
-            free(object);
-            return map_ntstatus(status);
-        }
-
-        set_object_property(object, NCRYPT_LENGTH_PROPERTY, (BYTE *)&bitlen, sizeof(bitlen));
-        set_object_property(object, BCRYPT_PUBLIC_KEY_LENGTH, (BYTE *)&bitlen, sizeof(bitlen));
+        if (!(copy = malloc(datasize))) return NTE_NO_MEMORY;
+        memcpy(copy, data, datasize);
+        copy->dwMagic = private ? BCRYPT_ECDSA_PRIVATE_P256_MAGIC : BCRYPT_ECDSA_PUBLIC_P256_MAGIC;
+        ret = import_ecdsa_p256(provider, private, (BYTE *)copy, datasize, &object);
+        free(copy);
+        if (ret != ERROR_SUCCESS) return ret;
         break;
     }
     default:

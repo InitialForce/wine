@@ -51,6 +51,8 @@ typedef struct _NCryptBufferDesc {
     PNCryptBuffer pBuffers;
 } NCryptBufferDesc, *PNCryptBufferDesc;
 
+#define NCRYPTBUFFER_ECC_CURVE_NAME 60
+
 typedef struct NCryptKeyName {
     LPWSTR pszName;
     LPWSTR pszAlgid;
