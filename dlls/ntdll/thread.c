@@ -476,6 +476,57 @@ static void unlock_fls_data(void)
     RtlLeaveCriticalSection( &fls_section );
 }
 
+/* An FLS callback running on some thread. It is on the heap, not the stack, since a thread can be
+ * terminated while its callback runs. */
+struct fls_running_callback
+{
+    LIST_ENTRY entry;
+    ULONG      index;
+    HANDLE     thread;
+};
+
+static LIST_ENTRY fls_running_callbacks = { &fls_running_callbacks, &fls_running_callbacks };
+
+/* Called with the FLS lock held, and returns with it held. The callback runs without the lock,
+ * since it may block or start a thread, and a thread that is starting takes the FLS lock while
+ * it holds the loader lock. */
+static void call_fls_callback( PFLS_CALLBACK_FUNCTION callback, ULONG index, void *data )
+{
+    struct fls_running_callback *running;
+
+    if ((running = RtlAllocateHeap( GetProcessHeap(), 0, sizeof(*running) )))
+    {
+        running->index = index;
+        running->thread = NtCurrentTeb()->ClientId.UniqueThread;
+        InsertTailList( &fls_running_callbacks, &running->entry );
+    }
+    unlock_fls_data();
+
+    TRACE_(relay)( "Calling FLS callback %p, arg %p.\n", callback, data );
+    callback( data );
+
+    lock_fls_data();
+    if (running)
+    {
+        RemoveEntryList( &running->entry );
+        RtlFreeHeap( GetProcessHeap(), 0, running );
+    }
+}
+
+/* Whether another thread is running a callback for the FLS index. Called with the FLS lock held. */
+static BOOL fls_callback_running_elsewhere( ULONG index )
+{
+    HANDLE thread = NtCurrentTeb()->ClientId.UniqueThread;
+    LIST_ENTRY *entry;
+
+    for (entry = fls_running_callbacks.Flink; entry != &fls_running_callbacks; entry = entry->Flink)
+    {
+        struct fls_running_callback *running = CONTAINING_RECORD( entry, struct fls_running_callback, entry );
+        if (running->index == index && running->thread != thread) return TRUE;
+    }
+    return FALSE;
+}
+
 static unsigned int fls_chunk_size( unsigned int chunk_index )
 {
     return 0x10 << chunk_index;
@@ -586,6 +637,7 @@ NTSTATUS WINAPI DECLSPEC_HOTPATCH RtlFlsFree( ULONG index )
     unsigned int chunk_index, idx;
     FLS_INFO_CHUNK *chunk;
     LIST_ENTRY *entry;
+    void *data;
 
     lock_fls_data();
 
@@ -597,31 +649,49 @@ NTSTATUS WINAPI DECLSPEC_HOTPATCH RtlFlsFree( ULONG index )
 
     chunk_index = fls_chunk_index_from_index( index, &idx );
     if (!(chunk = fls_data.fls_callback_chunks[chunk_index])
-            || !(callback = chunk->callbacks[idx].callback))
+            || !(callback = chunk->callbacks[idx].callback)
+            || chunk->callbacks[idx].unknown)
     {
         unlock_fls_data();
         return STATUS_INVALID_PARAMETER;
     }
 
+    /* Marks the index as being freed, so that a second RtlFlsFree fails and RtlFlsAlloc does not
+     * hand it out while the callbacks run without the lock. */
+    chunk->callbacks[idx].unknown = (void *)1;
+
+restart:
     for (entry = fls_data.fls_list_head.Flink; entry != &fls_data.fls_list_head; entry = entry->Flink)
     {
         TEB_FLS_DATA *fls = CONTAINING_RECORD(entry, TEB_FLS_DATA, fls_list_entry);
 
-        if (fls->fls_data_chunks[chunk_index] && fls->fls_data_chunks[chunk_index][idx + 1])
+        if (fls->fls_data_chunks[chunk_index] && (data = fls->fls_data_chunks[chunk_index][idx + 1]))
         {
+            fls->fls_data_chunks[chunk_index][idx + 1] = NULL;
             if (callback != (void *)~(ULONG_PTR)0)
             {
-                TRACE_(relay)("Calling FLS callback %p, arg %p.\n", callback,
-                        fls->fls_data_chunks[chunk_index][idx + 1]);
-
-                callback( fls->fls_data_chunks[chunk_index][idx + 1] );
+                /* The list may change while the callback runs. */
+                call_fls_callback( callback, index, data );
+                goto restart;
             }
-            fls->fls_data_chunks[chunk_index][idx + 1] = NULL;
         }
+    }
+
+    /* A thread that is ending may have taken its value before this thread could, and still be
+     * running the callback. The index stays allocated until it returns. */
+    while (fls_callback_running_elsewhere( index ))
+    {
+        LARGE_INTEGER timeout;
+
+        unlock_fls_data();
+        timeout.QuadPart = -10000; /* 1 ms */
+        NtDelayExecution( FALSE, &timeout );
+        lock_fls_data();
     }
 
     --chunk->count;
     chunk->callbacks[idx].callback = NULL;
+    chunk->callbacks[idx].unknown = NULL;
 
     unlock_fls_data();
     return STATUS_SUCCESS;
@@ -695,25 +765,22 @@ void WINAPI DECLSPEC_HOTPATCH RtlProcessFlsData( void *teb_fls_data, ULONG flags
         lock_fls_data();
         for (i = 0; i < ARRAY_SIZE(fls->fls_data_chunks); ++i)
         {
-            if (!fls->fls_data_chunks[i] || !fls_data.fls_callback_chunks[i]
-                    || !fls_data.fls_callback_chunks[i]->count)
-                continue;
-
             for (index = 0; index < fls_chunk_size( i ); ++index)
             {
-                PFLS_CALLBACK_FUNCTION callback = fls_data.fls_callback_chunks[i]->callbacks[index].callback;
+                PFLS_CALLBACK_FUNCTION callback;
+                void *data;
 
-                if (!fls->fls_data_chunks[i][index + 1])
+                /* Read each time: a callback may set values, or free an index, while it runs. */
+                if (!fls->fls_data_chunks[i] || !fls_data.fls_callback_chunks[i]
+                        || !fls_data.fls_callback_chunks[i]->count)
+                    break;
+                if (!(data = fls->fls_data_chunks[i][index + 1]))
                     continue;
 
-                if (callback && callback != (void *)~(ULONG_PTR)0)
-                {
-                    TRACE_(relay)("Calling FLS callback %p, arg %p.\n", callback,
-                            fls->fls_data_chunks[i][index + 1]);
-
-                    callback( fls->fls_data_chunks[i][index + 1] );
-                }
+                callback = fls_data.fls_callback_chunks[i]->callbacks[index].callback;
                 fls->fls_data_chunks[i][index + 1] = NULL;
+                if (callback && callback != (void *)~(ULONG_PTR)0)
+                    call_fls_callback( callback, fls_index_from_chunk_index( i, index ), data );
             }
         }
         /* Not using RemoveEntryList() as Windows does not zero list entry here. */
