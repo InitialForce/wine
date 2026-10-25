@@ -5567,8 +5567,56 @@ static void test_chain_engine_cache_update(void)
     CertFreeCertificateContext(cert);
 }
 
+/* .NET passes an engine config that ends at hExclusiveTrustedPeople, without dwExclusiveFlags. */
+static void test_exclusive_root_without_exclusive_flags(void)
+{
+    CERT_CHAIN_ENGINE_CONFIG config = { 0 };
+    CERT_CHAIN_PARA para = { sizeof(para) };
+    PCCERT_CHAIN_CONTEXT chain;
+    HCERTCHAINENGINE engine;
+    PCCERT_CONTEXT leaf;
+    HCERTSTORE root;
+    FILETIME time;
+    BOOL ret;
+
+    root = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
+    ret = CertAddEncodedCertificateToStore(root, X509_ASN_ENCODING, chain0_0, sizeof(chain0_0),
+                                           CERT_STORE_ADD_ALWAYS, NULL);
+    ok(ret, "CertAddEncodedCertificateToStore failed: %08lx\n", GetLastError());
+    leaf = CertCreateCertificateContext(X509_ASN_ENCODING, chain0_1, sizeof(chain0_1));
+    ok(leaf != NULL, "CertCreateCertificateContext failed: %08lx\n", GetLastError());
+
+    config.cbSize = FIELD_OFFSET(CERT_CHAIN_ENGINE_CONFIG, dwExclusiveFlags);
+    config.hExclusiveRoot = root;
+    ret = CertCreateCertificateChainEngine(&config, &engine);
+    if (!ret)
+    {
+        win_skip("hExclusiveRoot is not supported\n");
+        CertFreeCertificateContext(leaf);
+        CertCloseStore(root, 0);
+        return;
+    }
+
+    SystemTimeToFileTime(&oct2007, &time);
+    ret = CertGetCertificateChain(engine, leaf, &time, NULL, &para, 0, NULL, &chain);
+    ok(ret, "CertGetCertificateChain failed: %08lx\n", GetLastError());
+    if (ret)
+    {
+        ok(!(chain->TrustStatus.dwErrorStatus & (CERT_TRUST_IS_PARTIAL_CHAIN | CERT_TRUST_IS_UNTRUSTED_ROOT)),
+           "got error status %08lx\n", chain->TrustStatus.dwErrorStatus);
+        ok(chain->cChain == 1, "got %lu simple chains\n", chain->cChain);
+        ok(chain->rgpChain[0]->cElement == 2, "got %lu elements\n", chain->rgpChain[0]->cElement);
+        CertFreeCertificateChain(chain);
+    }
+
+    CertFreeCertificateChainEngine(engine);
+    CertFreeCertificateContext(leaf);
+    CertCloseStore(root, 0);
+}
+
 START_TEST(chain)
 {
+    test_exclusive_root_without_exclusive_flags();
     testCreateCertChainEngine();
     testVerifyCertChainPolicy();
     testGetCertChain();
