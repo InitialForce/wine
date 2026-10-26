@@ -868,7 +868,8 @@ static void check_ecdsa_p256_properties(NCRYPT_KEY_HANDLE key)
 }
 
 /* Wine returns NTE_INVALID_PARAMETER for every rejected import. win_ret is the code Windows is expected to
- * return; it has not been measured on Windows. */
+ * return; it has not been measured on Windows. The trace line reports the actual status of every case, so
+ * one Windows run gives all the codes. */
 static void check_import_fails(NCRYPT_PROV_HANDLE prov, const WCHAR *type, NCryptBufferDesc *params, BYTE *blob,
                                DWORD size, SECURITY_STATUS win_ret, const char *what)
 {
@@ -876,9 +877,36 @@ static void check_import_fails(NCRYPT_PROV_HANDLE prov, const WCHAR *type, NCryp
     SECURITY_STATUS ret;
 
     ret = NCryptImportKey(prov, 0, type, params, &imported, blob, size, 0);
-    ok(ret == NTE_INVALID_PARAMETER || broken(ret == win_ret), "%s: got %#lx\n", what, ret);
-    ok(!imported, "%s: got a key\n", what);
+    trace("rejected import \"%s\": got %#lx\n", what, ret);
+    ok(ret == NTE_INVALID_PARAMETER || broken(ret == win_ret), "rejected import \"%s\": got %#lx\n", what, ret);
+    ok(!imported, "rejected import \"%s\": got a key\n", what);
     if (imported) NCryptFreeObject(imported);
+}
+
+/* Places the first size bytes of blob so that they end where a PAGE_NOACCESS page starts, so a read past
+ * size faults. A 0-byte blob points at the start of that page. */
+static void check_short_import_fails(NCRYPT_PROV_HANDLE prov, const WCHAR *type, const BYTE *blob, DWORD size,
+                                     SECURITY_STATUS win_ret, const char *what)
+{
+    SYSTEM_INFO info;
+    DWORD old_protect;
+    BYTE *pages;
+    BOOL ret;
+
+    GetSystemInfo(&info);
+    pages = VirtualAlloc(NULL, 2 * info.dwPageSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    ok(pages != NULL, "VirtualAlloc failed: %lu\n", GetLastError());
+    if (!pages) return;
+    ret = VirtualProtect(pages + info.dwPageSize, info.dwPageSize, PAGE_NOACCESS, &old_protect);
+    ok(ret, "VirtualProtect failed: %lu\n", GetLastError());
+    if (ret)
+    {
+        BYTE *end = pages + info.dwPageSize;
+
+        memcpy(end - size, blob, size);
+        check_import_fails(prov, type, NULL, end - size, size, win_ret, what);
+    }
+    VirtualFree(pages, 0, MEM_RELEASE);
 }
 
 static void test_ecdsa_p256_key(void)
@@ -924,10 +952,10 @@ static void test_ecdsa_p256_key(void)
     check_import_fails(prov, BCRYPT_PRIVATE_KEY_BLOB, NULL, blob, size, NTE_BAD_DATA, "public P-256 blob as PRIVATEBLOB");
 
     /* A blob shorter than its header is rejected before the magic is read. */
-    check_import_fails(prov, BCRYPT_ECCPUBLIC_BLOB, NULL, blob, 0, NTE_INVALID_PARAMETER, "0-byte blob");
-    check_import_fails(prov, BCRYPT_ECCPUBLIC_BLOB, NULL, blob, 1, NTE_BAD_DATA, "1-byte blob");
-    check_import_fails(prov, BCRYPT_ECCPUBLIC_BLOB, NULL, blob, sizeof(BCRYPT_KEY_BLOB) - 1, NTE_BAD_DATA,
-                       "blob 1 byte short of its header");
+    check_short_import_fails(prov, BCRYPT_ECCPUBLIC_BLOB, blob, 0, NTE_INVALID_PARAMETER, "0-byte blob");
+    check_short_import_fails(prov, BCRYPT_ECCPUBLIC_BLOB, blob, 1, NTE_BAD_DATA, "1-byte blob");
+    check_short_import_fails(prov, BCRYPT_ECCPUBLIC_BLOB, blob, sizeof(BCRYPT_KEY_BLOB) - 1, NTE_BAD_DATA,
+                             "blob 1 byte short of its header");
 
     size = 0;
     ret = NCryptExportKey(key, 0, BCRYPT_ECCPRIVATE_BLOB, NULL, blob, sizeof(blob), &size, 0);
