@@ -867,14 +867,16 @@ static void check_ecdsa_p256_properties(NCRYPT_KEY_HANDLE key)
     ok(length == 256, "got %lu\n", length);
 }
 
+/* Wine returns NTE_INVALID_PARAMETER for every rejected import. win_ret is the code Windows is expected to
+ * return; it has not been measured on Windows. */
 static void check_import_fails(NCRYPT_PROV_HANDLE prov, const WCHAR *type, NCryptBufferDesc *params, BYTE *blob,
-                               DWORD size, const char *what)
+                               DWORD size, SECURITY_STATUS win_ret, const char *what)
 {
     NCRYPT_KEY_HANDLE imported = 0;
     SECURITY_STATUS ret;
 
     ret = NCryptImportKey(prov, 0, type, params, &imported, blob, size, 0);
-    ok(ret == NTE_INVALID_PARAMETER || broken(ret != ERROR_SUCCESS), "%s: got %#lx\n", what, ret);
+    ok(ret == NTE_INVALID_PARAMETER || broken(ret == win_ret), "%s: got %#lx\n", what, ret);
     ok(!imported, "%s: got a key\n", what);
     if (imported) NCryptFreeObject(imported);
 }
@@ -914,6 +916,19 @@ static void test_ecdsa_p256_key(void)
     check_ecdsa_p256_properties(imported);
     NCryptFreeObject(imported);
 
+    imported = 0;
+    ret = NCryptImportKey(prov, 0, BCRYPT_PUBLIC_KEY_BLOB, NULL, &imported, blob, size, 0);
+    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
+    check_ecdsa_p256_properties(imported);
+    NCryptFreeObject(imported);
+    check_import_fails(prov, BCRYPT_PRIVATE_KEY_BLOB, NULL, blob, size, NTE_BAD_DATA, "public P-256 blob as PRIVATEBLOB");
+
+    /* A blob shorter than its header is rejected before the magic is read. */
+    check_import_fails(prov, BCRYPT_ECCPUBLIC_BLOB, NULL, blob, 0, NTE_INVALID_PARAMETER, "0-byte blob");
+    check_import_fails(prov, BCRYPT_ECCPUBLIC_BLOB, NULL, blob, 1, NTE_BAD_DATA, "1-byte blob");
+    check_import_fails(prov, BCRYPT_ECCPUBLIC_BLOB, NULL, blob, sizeof(BCRYPT_KEY_BLOB) - 1, NTE_BAD_DATA,
+                       "blob 1 byte short of its header");
+
     size = 0;
     ret = NCryptExportKey(key, 0, BCRYPT_ECCPRIVATE_BLOB, NULL, blob, sizeof(blob), &size, 0);
     ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
@@ -925,6 +940,13 @@ static void test_ecdsa_p256_key(void)
     ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
     check_ecdsa_p256_properties(imported);
     NCryptFreeObject(imported);
+
+    imported = 0;
+    ret = NCryptImportKey(prov, 0, BCRYPT_PRIVATE_KEY_BLOB, NULL, &imported, blob, size, 0);
+    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
+    check_ecdsa_p256_properties(imported);
+    NCryptFreeObject(imported);
+    check_import_fails(prov, BCRYPT_PUBLIC_KEY_BLOB, NULL, blob, size, NTE_BAD_DATA, "private P-256 blob as PUBLICBLOB");
 
     /* .NET's ECDsaCng.ImportParameters names the curve in the parameters. */
     curve_buffer.cbBuffer = sizeof(L"nistP256");
@@ -941,20 +963,20 @@ static void test_ecdsa_p256_key(void)
 
     /* A malformed curve name buffer is rejected. */
     curve_buffer.cbBuffer = sizeof(L"nistP256") - sizeof(WCHAR);
-    check_import_fails(prov, BCRYPT_ECCPRIVATE_BLOB, &curve_params, blob, size, "unterminated name");
+    check_import_fails(prov, BCRYPT_ECCPRIVATE_BLOB, &curve_params, blob, size, NTE_INVALID_PARAMETER, "unterminated name");
     curve_buffer.cbBuffer = 0;
-    check_import_fails(prov, BCRYPT_ECCPRIVATE_BLOB, &curve_params, blob, size, "zero length");
+    check_import_fails(prov, BCRYPT_ECCPRIVATE_BLOB, &curve_params, blob, size, NTE_INVALID_PARAMETER, "zero length");
     curve_buffer.cbBuffer = sizeof(L"nistP256") - 1;
-    check_import_fails(prov, BCRYPT_ECCPRIVATE_BLOB, &curve_params, blob, size, "odd length");
+    check_import_fails(prov, BCRYPT_ECCPRIVATE_BLOB, &curve_params, blob, size, NTE_INVALID_PARAMETER, "odd length");
     curve_buffer.cbBuffer = sizeof(L"nistP256");
     curve_params.ulVersion = BCRYPTBUFFER_VERSION + 1;
-    check_import_fails(prov, BCRYPT_ECCPRIVATE_BLOB, &curve_params, blob, size, "wrong version");
+    check_import_fails(prov, BCRYPT_ECCPRIVATE_BLOB, &curve_params, blob, size, NTE_INVALID_PARAMETER, "wrong version");
     curve_params.ulVersion = BCRYPTBUFFER_VERSION;
 
     /* An ECC blob is accepted only under the blob type that matches its magic. */
-    check_import_fails(prov, BCRYPT_RSAPUBLIC_BLOB, NULL, blob, size, "private P-256 blob as RSAPUBLICBLOB");
-    check_import_fails(prov, BCRYPT_ECCPUBLIC_BLOB, NULL, blob, size, "private P-256 blob as ECCPUBLICBLOB");
-    check_import_fails(prov, NULL, NULL, blob, size, "private P-256 blob without a type");
+    check_import_fails(prov, BCRYPT_RSAPUBLIC_BLOB, NULL, blob, size, NTE_BAD_DATA, "private P-256 blob as RSAPUBLICBLOB");
+    check_import_fails(prov, BCRYPT_ECCPUBLIC_BLOB, NULL, blob, size, NTE_BAD_DATA, "private P-256 blob as ECCPUBLICBLOB");
+    check_import_fails(prov, NULL, NULL, blob, size, NTE_INVALID_PARAMETER, "private P-256 blob without a type");
 
     header->dwMagic = BCRYPT_ECDSA_PRIVATE_GENERIC_MAGIC;
     imported = 0;
@@ -963,8 +985,9 @@ static void test_ecdsa_p256_key(void)
     check_ecdsa_p256_properties(imported);
     NCryptFreeObject(imported);
 
-    check_import_fails(prov, BCRYPT_RSAPUBLIC_BLOB, &curve_params, blob, size, "generic blob as RSAPUBLICBLOB");
-    check_import_fails(prov, BCRYPT_ECCPUBLIC_BLOB, &curve_params, blob, size, "generic private blob as ECCPUBLICBLOB");
+    check_import_fails(prov, BCRYPT_RSAPUBLIC_BLOB, &curve_params, blob, size, NTE_BAD_DATA, "generic blob as RSAPUBLICBLOB");
+    check_import_fails(prov, BCRYPT_ECCPUBLIC_BLOB, &curve_params, blob, size, NTE_BAD_DATA,
+                       "generic private blob as ECCPUBLICBLOB");
 
     NCryptFreeObject(key);
     NCryptFreeObject(prov);

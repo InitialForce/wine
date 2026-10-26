@@ -70,7 +70,7 @@ static struct object_property *get_object_property(struct object *object, const 
     for (i = 0; i < object->num_properties; i++)
     {
         struct object_property *property = &object->properties[i];
-        if (!lstrcmpW(property->key, name)) return property;
+        if (property->key && !lstrcmpW(property->key, name)) return property;
     }
     return NULL;
 }
@@ -132,54 +132,58 @@ static SECURITY_STATUS set_object_property(struct object *object, const WCHAR *n
     return ERROR_SUCCESS;
 }
 
+static void free_object(struct object *object);
+
 static struct object *create_key_object(enum algid algid, NCRYPT_PROV_HANDLE provider)
 {
     NCRYPT_SUPPORTED_LENGTHS supported_lengths = {512, 16384, 8, 1024};
+    DWORD block_length = 128, signature_length = 128, export_policy = 0, usage = NCRYPT_ALLOW_ALL_USAGES, key_type = 0;
     struct object *object;
-    DWORD dw_value;
+    SECURITY_STATUS ret;
 
-    switch (algid)
+    if (algid != RSA && algid != ECDSA_P256)
     {
-    case RSA:
-        if (!(object = allocate_object(KEY))) return NULL;
-
-        object->key.algid = RSA;
-        set_object_property(object, NCRYPT_ALGORITHM_PROPERTY, (BYTE *)BCRYPT_RSA_ALGORITHM,
-                            sizeof(BCRYPT_RSA_ALGORITHM));
-        set_object_property(object, NCRYPT_ALGORITHM_GROUP_PROPERTY, (BYTE *)BCRYPT_RSA_ALGORITHM,
-                            sizeof(BCRYPT_RSA_ALGORITHM));
-        set_object_property(object, NCRYPT_LENGTHS_PROPERTY, (BYTE *)&supported_lengths,
-                            sizeof(supported_lengths));
-        dw_value = 128;
-        set_object_property(object, NCRYPT_BLOCK_LENGTH_PROPERTY, (BYTE *)&dw_value, sizeof(dw_value));
-        dw_value = 128;
-        set_object_property(object, BCRYPT_SIGNATURE_LENGTH, (BYTE *)&dw_value, sizeof(dw_value));
-        break;
-
-    case ECDSA_P256:
-        if (!(object = allocate_object(KEY))) return NULL;
-
-        object->key.algid = ECDSA_P256;
-        set_object_property(object, NCRYPT_ALGORITHM_PROPERTY, (BYTE *)BCRYPT_ECDSA_P256_ALGORITHM,
-                            sizeof(BCRYPT_ECDSA_P256_ALGORITHM));
-        set_object_property(object, NCRYPT_ALGORITHM_GROUP_PROPERTY, (BYTE *)NCRYPT_ECDSA_ALGORITHM_GROUP,
-                            sizeof(NCRYPT_ECDSA_ALGORITHM_GROUP));
-        break;
-
-    default:
         ERR("Invalid algid %#x\n", algid);
         return NULL;
     }
+    if (!(object = allocate_object(KEY))) return NULL;
+    object->key.algid = algid;
 
-    dw_value = 0;
-    set_object_property(object, NCRYPT_EXPORT_POLICY_PROPERTY, (BYTE *)&dw_value, sizeof(dw_value));
-    dw_value = NCRYPT_ALLOW_ALL_USAGES;
-    set_object_property(object, NCRYPT_KEY_USAGE_PROPERTY, (BYTE *)&dw_value, sizeof(dw_value));
-    dw_value = 0;
-    set_object_property(object, NCRYPT_KEY_TYPE_PROPERTY, (BYTE *)&dw_value, sizeof(dw_value));
+    if (algid == RSA)
+    {
+        if ((ret = set_object_property(object, NCRYPT_ALGORITHM_PROPERTY, (BYTE *)BCRYPT_RSA_ALGORITHM,
+                                       sizeof(BCRYPT_RSA_ALGORITHM)))) goto fail;
+        if ((ret = set_object_property(object, NCRYPT_ALGORITHM_GROUP_PROPERTY, (BYTE *)BCRYPT_RSA_ALGORITHM,
+                                       sizeof(BCRYPT_RSA_ALGORITHM)))) goto fail;
+        if ((ret = set_object_property(object, NCRYPT_LENGTHS_PROPERTY, (BYTE *)&supported_lengths,
+                                       sizeof(supported_lengths)))) goto fail;
+        if ((ret = set_object_property(object, NCRYPT_BLOCK_LENGTH_PROPERTY, (BYTE *)&block_length,
+                                       sizeof(block_length)))) goto fail;
+        if ((ret = set_object_property(object, BCRYPT_SIGNATURE_LENGTH, (BYTE *)&signature_length,
+                                       sizeof(signature_length)))) goto fail;
+    }
+    else
+    {
+        if ((ret = set_object_property(object, NCRYPT_ALGORITHM_PROPERTY, (BYTE *)BCRYPT_ECDSA_P256_ALGORITHM,
+                                       sizeof(BCRYPT_ECDSA_P256_ALGORITHM)))) goto fail;
+        if ((ret = set_object_property(object, NCRYPT_ALGORITHM_GROUP_PROPERTY, (BYTE *)NCRYPT_ECDSA_ALGORITHM_GROUP,
+                                       sizeof(NCRYPT_ECDSA_ALGORITHM_GROUP)))) goto fail;
+    }
+
+    if ((ret = set_object_property(object, NCRYPT_EXPORT_POLICY_PROPERTY, (BYTE *)&export_policy,
+                                   sizeof(export_policy)))) goto fail;
+    if ((ret = set_object_property(object, NCRYPT_KEY_USAGE_PROPERTY, (BYTE *)&usage, sizeof(usage)))) goto fail;
+    if ((ret = set_object_property(object, NCRYPT_KEY_TYPE_PROPERTY, (BYTE *)&key_type, sizeof(key_type)))) goto fail;
+    /* The reference is taken only once the property that free_object releases it through exists. */
+    if ((ret = set_object_property(object, NCRYPT_PROVIDER_HANDLE_PROPERTY, (BYTE *)&provider,
+                                   sizeof(provider)))) goto fail;
     provider_addref(provider);
-    set_object_property(object, NCRYPT_PROVIDER_HANDLE_PROPERTY, (BYTE *)&provider, sizeof(provider));
     return object;
+
+fail:
+    ERR("Error allocating memory\n");
+    free_object(object);
+    return NULL;
 }
 
 /* Releases the properties, and the provider reference a key holds, then the object itself. */
@@ -189,7 +193,8 @@ static void free_object(struct object *object)
 
     for (i = 0; i < object->num_properties; i++)
     {
-        if (!wcscmp(object->properties[i].key, NCRYPT_PROVIDER_HANDLE_PROPERTY))
+        if (object->properties[i].key && object->properties[i].value &&
+            !wcscmp(object->properties[i].key, NCRYPT_PROVIDER_HANDLE_PROPERTY))
             NCryptFreeObject(*(NCRYPT_HANDLE *)object->properties[i].value);
 
         free(object->properties[i].key);
@@ -197,6 +202,20 @@ static void free_object(struct object *object)
     }
     free(object->properties);
     free(object);
+}
+
+/* Records the key length on a key whose BCrypt key exists; on failure destroys the whole key. */
+static SECURITY_STATUS set_key_length(struct object *object, DWORD bitlen)
+{
+    SECURITY_STATUS ret;
+
+    if ((ret = set_object_property(object, NCRYPT_LENGTH_PROPERTY, (BYTE *)&bitlen, sizeof(bitlen))) ||
+        (ret = set_object_property(object, BCRYPT_PUBLIC_KEY_LENGTH, (BYTE *)&bitlen, sizeof(bitlen))))
+    {
+        BCryptDestroyKey(object->key.bcrypt_key);
+        free_object(object);
+    }
+    return ret;
 }
 
 SECURITY_STATUS WINAPI NCryptCreatePersistedKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_HANDLE *key,
@@ -230,8 +249,7 @@ SECURITY_STATUS WINAPI NCryptCreatePersistedKey(NCRYPT_PROV_HANDLE provider, NCR
             return map_ntstatus(status);
         }
 
-        set_object_property(object, NCRYPT_LENGTH_PROPERTY, (BYTE *)&default_bitlen, sizeof(default_bitlen));
-        set_object_property(object, BCRYPT_PUBLIC_KEY_LENGTH, (BYTE *)&default_bitlen, sizeof(default_bitlen));
+        if ((status = set_key_length(object, default_bitlen))) return status;
     }
     else if (!lstrcmpiW(algid, BCRYPT_ECDSA_P256_ALGORITHM))
     {
@@ -248,8 +266,7 @@ SECURITY_STATUS WINAPI NCryptCreatePersistedKey(NCRYPT_PROV_HANDLE provider, NCR
             return map_ntstatus(status);
         }
 
-        set_object_property(object, NCRYPT_LENGTH_PROPERTY, (BYTE *)&bitlen, sizeof(bitlen));
-        set_object_property(object, BCRYPT_PUBLIC_KEY_LENGTH, (BYTE *)&bitlen, sizeof(bitlen));
+        if ((status = set_key_length(object, bitlen))) return status;
     }
     else
     {
@@ -437,17 +454,20 @@ static SECURITY_STATUS check_p256_curve_params(const NCryptBufferDesc *params)
     return ERROR_SUCCESS;
 }
 
-/* An ECC blob is accepted only under the blob type that matches its magic. */
+/* An ECC blob is accepted only under a blob type of the same kind as its magic: the ECC type or the
+ * generic alias. */
 static BOOL ecc_blob_type_matches(const WCHAR *type, BOOL private)
 {
     if (!type) return FALSE;
-    return !wcscmp(type, private ? BCRYPT_ECCPRIVATE_BLOB : BCRYPT_ECCPUBLIC_BLOB);
+    if (private) return !wcscmp(type, BCRYPT_ECCPRIVATE_BLOB) || !wcscmp(type, BCRYPT_PRIVATE_KEY_BLOB);
+    return !wcscmp(type, BCRYPT_ECCPUBLIC_BLOB) || !wcscmp(type, BCRYPT_PUBLIC_KEY_BLOB);
 }
 
 static SECURITY_STATUS import_ecdsa_p256(NCRYPT_PROV_HANDLE provider, BOOL private, BYTE *data, DWORD datasize,
                                          struct object **ret_object)
 {
     struct object *object;
+    SECURITY_STATUS ret;
     NTSTATUS status;
     DWORD bitlen = 256;
 
@@ -467,8 +487,7 @@ static SECURITY_STATUS import_ecdsa_p256(NCRYPT_PROV_HANDLE provider, BOOL priva
         return map_ntstatus(status);
     }
 
-    set_object_property(object, NCRYPT_LENGTH_PROPERTY, (BYTE *)&bitlen, sizeof(bitlen));
-    set_object_property(object, BCRYPT_PUBLIC_KEY_LENGTH, (BYTE *)&bitlen, sizeof(bitlen));
+    if ((ret = set_key_length(object, bitlen))) return ret;
     *ret_object = object;
     return ERROR_SUCCESS;
 }
@@ -504,7 +523,11 @@ SECURITY_STATUS WINAPI NCryptImportKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_H
         WARN("Invalid flags %#lx\n", flags);
         return NTE_BAD_FLAGS;
     }
-    if (!header) return NTE_INVALID_PARAMETER;
+    if (!header || datasize < sizeof(*header))
+    {
+        WARN("Blob of %lu bytes is too small\n", datasize);
+        return NTE_INVALID_PARAMETER;
+    }
 
     switch (header->Magic)
     {
@@ -534,8 +557,7 @@ SECURITY_STATUS WINAPI NCryptImportKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_H
             return map_ntstatus(status);
         }
 
-        set_object_property(object, NCRYPT_LENGTH_PROPERTY, (BYTE *)&rsablob->BitLength, sizeof(rsablob->BitLength));
-        set_object_property(object, BCRYPT_PUBLIC_KEY_LENGTH, (BYTE *)&rsablob->BitLength, sizeof(rsablob->BitLength));
+        if ((status = set_key_length(object, rsablob->BitLength))) return status;
         break;
     }
     case BCRYPT_ECDSA_PRIVATE_P256_MAGIC:
