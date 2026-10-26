@@ -5614,8 +5614,10 @@ static void test_exclusive_root_without_exclusive_flags(void)
     CertCloseStore(root, 0);
 }
 
-/* Builds a chain for cert with an engine whose only trusted root store is the given exclusive store. */
-static DWORD get_exclusive_chain_error(HCERTSTORE exclusive, PCCERT_CONTEXT cert, const FILETIME *time)
+/* Builds a chain for cert with an engine whose only trusted root store is the given exclusive store.
+ * extra, if set, is searched for issuers but not trusted. */
+static DWORD get_exclusive_chain_error(HCERTSTORE exclusive, HCERTSTORE extra, PCCERT_CONTEXT cert,
+                                       const FILETIME *time)
 {
     CERT_CHAIN_ENGINE_CONFIG config = { 0 };
     CERT_CHAIN_PARA para = { sizeof(para) };
@@ -5630,7 +5632,7 @@ static DWORD get_exclusive_chain_error(HCERTSTORE exclusive, PCCERT_CONTEXT cert
     ok(ret, "CertCreateCertificateChainEngine failed: %08lx\n", GetLastError());
     if (!ret) return 0;
 
-    ret = CertGetCertificateChain(engine, cert, (FILETIME *)time, NULL, &para, 0, NULL, &chain);
+    ret = CertGetCertificateChain(engine, cert, (FILETIME *)time, extra, &para, 0, NULL, &chain);
     ok(ret, "CertGetCertificateChain failed: %08lx\n", GetLastError());
     error = ret ? chain->TrustStatus.dwErrorStatus : 0;
     if (ret) CertFreeCertificateChain(chain);
@@ -5638,60 +5640,88 @@ static DWORD get_exclusive_chain_error(HCERTSTORE exclusive, PCCERT_CONTEXT cert
     return error;
 }
 
-/* A root outside the exclusive store is not trusted, even when the system trusts it. */
+/* A root outside the exclusive store is not trusted, even when it is in the chain or the system trusts it. */
 static void test_exclusive_root_rejects_other_roots(void)
 {
+    static const DWORD supported_sizes[] =
+    {
+        FIELD_OFFSET(CERT_CHAIN_ENGINE_CONFIG, hExclusiveRoot),
+        FIELD_OFFSET(CERT_CHAIN_ENGINE_CONFIG, dwExclusiveFlags),
+        sizeof(CERT_CHAIN_ENGINE_CONFIG),
+    };
     CERT_CHAIN_ENGINE_CONFIG config = { 0 };
     HCERTCHAINENGINE engine;
     PCCERT_CONTEXT leaf, system_root;
-    HCERTSTORE empty, unrelated, system;
+    HCERTSTORE empty, other_root, chain_root, system;
     FILETIME time;
-    DWORD error;
-    BOOL ret;
+    DWORD error, size;
+    unsigned int i, j, k;
+    BOOL ret, supported;
 
     empty = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
-    unrelated = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
-    ret = CertAddEncodedCertificateToStore(unrelated, X509_ASN_ENCODING, chain0_0, sizeof(chain0_0),
+    other_root = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
+    ret = CertAddEncodedCertificateToStore(other_root, X509_ASN_ENCODING, selfSignedCert, sizeof(selfSignedCert),
+                                           CERT_STORE_ADD_ALWAYS, NULL);
+    ok(ret, "CertAddEncodedCertificateToStore failed: %08lx\n", GetLastError());
+    chain_root = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
+    ret = CertAddEncodedCertificateToStore(chain_root, X509_ASN_ENCODING, chain0_0, sizeof(chain0_0),
                                            CERT_STORE_ADD_ALWAYS, NULL);
     ok(ret, "CertAddEncodedCertificateToStore failed: %08lx\n", GetLastError());
     leaf = CertCreateCertificateContext(X509_ASN_ENCODING, chain0_1, sizeof(chain0_1));
     ok(leaf != NULL, "CertCreateCertificateContext failed: %08lx\n", GetLastError());
+    SystemTimeToFileTime(&oct2007, &time);
 
     /* An empty exclusive store trusts nothing. */
-    SystemTimeToFileTime(&oct2007, &time);
-    error = get_exclusive_chain_error(empty, leaf, &time);
+    error = get_exclusive_chain_error(empty, NULL, leaf, &time);
     ok(error & (CERT_TRUST_IS_PARTIAL_CHAIN | CERT_TRUST_IS_UNTRUSTED_ROOT), "got error status %08lx\n", error);
+
+    /* The chain reaches its root through an additional store, but the exclusive store holds another root. */
+    error = get_exclusive_chain_error(other_root, chain_root, leaf, &time);
+    ok(error & CERT_TRUST_IS_UNTRUSTED_ROOT, "got error status %08lx\n", error);
+
+    /* The same chain is trusted once its root is the exclusive store. */
+    error = get_exclusive_chain_error(chain_root, NULL, leaf, &time);
+    ok(!(error & (CERT_TRUST_IS_PARTIAL_CHAIN | CERT_TRUST_IS_UNTRUSTED_ROOT)), "got error status %08lx\n", error);
 
     /* A root from the system Root store, chained under an exclusive store that does not hold it. */
     system = CertOpenSystemStoreW(0, L"Root");
     system_root = system ? CertEnumCertificatesInStore(system, NULL) : NULL;
     if (system_root)
     {
-        error = get_exclusive_chain_error(unrelated, system_root, NULL);
+        error = get_exclusive_chain_error(other_root, NULL, system_root, NULL);
         ok(error & CERT_TRUST_IS_UNTRUSTED_ROOT, "got error status %08lx\n", error);
         CertFreeCertificateContext(system_root);
     }
     else skip("no certificate in the system Root store\n");
     if (system) CertCloseStore(system, 0);
 
-    /* Sizes other than the three known config layouts are refused. */
-    config.hExclusiveRoot = unrelated;
-    config.cbSize = FIELD_OFFSET(CERT_CHAIN_ENGINE_CONFIG, hExclusiveTrustedPeople);
-    SetLastError(0xdeadbeef);
-    engine = NULL;
-    ret = CertCreateCertificateChainEngine(&config, &engine);
-    ok(!ret && GetLastError() == E_INVALIDARG, "size %lu: got %d, error %08lx\n", config.cbSize, ret, GetLastError());
-    if (ret) CertFreeCertificateChainEngine(engine);
+    /* Only the three known config layouts are accepted; the sizes next to each are refused. */
+    config.hExclusiveRoot = chain_root;
+    for (i = 0; i < ARRAY_SIZE(supported_sizes); i++)
+    {
+        for (j = 0; j < 3; j++)
+        {
+            size = supported_sizes[i] + j - 1;
+            supported = FALSE;
+            for (k = 0; k < ARRAY_SIZE(supported_sizes); k++) if (size == supported_sizes[k]) supported = TRUE;
+            if (j != 1 && supported) continue;
 
-    config.cbSize = FIELD_OFFSET(CERT_CHAIN_ENGINE_CONFIG, hExclusiveRoot) - sizeof(DWORD);
-    SetLastError(0xdeadbeef);
-    engine = NULL;
-    ret = CertCreateCertificateChainEngine(&config, &engine);
-    ok(!ret && GetLastError() == E_INVALIDARG, "size %lu: got %d, error %08lx\n", config.cbSize, ret, GetLastError());
-    if (ret) CertFreeCertificateChainEngine(engine);
+            config.cbSize = size;
+            SetLastError(0xdeadbeef);
+            engine = NULL;
+            ret = CertCreateCertificateChainEngine(&config, &engine);
+            if (supported)
+                ok(ret, "size %lu: CertCreateCertificateChainEngine failed: %08lx\n", size, GetLastError());
+            else
+                ok(!ret && GetLastError() == E_INVALIDARG, "size %lu: got %d, error %08lx\n",
+                   size, ret, GetLastError());
+            if (ret) CertFreeCertificateChainEngine(engine);
+        }
+    }
 
     CertFreeCertificateContext(leaf);
-    CertCloseStore(unrelated, 0);
+    CertCloseStore(chain_root, 0);
+    CertCloseStore(other_root, 0);
     CertCloseStore(empty, 0);
 }
 
