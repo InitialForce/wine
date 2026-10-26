@@ -5640,6 +5640,19 @@ static DWORD get_exclusive_chain_error(HCERTSTORE exclusive, HCERTSTORE extra, P
     return error;
 }
 
+/* Builds a chain for cert with the default engine at the current time. Returns ~0 if no chain is built. */
+static DWORD get_default_chain_error(PCCERT_CONTEXT cert)
+{
+    CERT_CHAIN_PARA para = { sizeof(para) };
+    PCCERT_CHAIN_CONTEXT chain;
+    DWORD error;
+
+    if (!CertGetCertificateChain(NULL, cert, NULL, NULL, &para, 0, NULL, &chain)) return ~0u;
+    error = chain->TrustStatus.dwErrorStatus;
+    CertFreeCertificateChain(chain);
+    return error;
+}
+
 /* A root outside the exclusive store is not trusted, even when it is in the chain or the system trusts it. */
 static void test_exclusive_root_rejects_other_roots(void)
 {
@@ -5683,16 +5696,22 @@ static void test_exclusive_root_rejects_other_roots(void)
     error = get_exclusive_chain_error(chain_root, NULL, leaf, &time);
     ok(!(error & (CERT_TRUST_IS_PARTIAL_CHAIN | CERT_TRUST_IS_UNTRUSTED_ROOT)), "got error status %08lx\n", error);
 
-    /* A root from the system Root store, chained under an exclusive store that does not hold it. */
+    /* A root from the system Root store, chained under an exclusive store that does not hold it. The case
+     * needs a root that the default engine trusts, so that the exclusive store is what makes it untrusted. */
     system = CertOpenSystemStoreW(0, L"Root");
-    system_root = system ? CertEnumCertificatesInStore(system, NULL) : NULL;
+    system_root = NULL;
+    while (system && (system_root = CertEnumCertificatesInStore(system, system_root)))
+    {
+        if (!(get_default_chain_error(system_root) & (CERT_TRUST_IS_UNTRUSTED_ROOT | CERT_TRUST_IS_PARTIAL_CHAIN)))
+            break;
+    }
     if (system_root)
     {
         error = get_exclusive_chain_error(other_root, NULL, system_root, NULL);
         ok(error & CERT_TRUST_IS_UNTRUSTED_ROOT, "got error status %08lx\n", error);
         CertFreeCertificateContext(system_root);
     }
-    else skip("no certificate in the system Root store\n");
+    else skip("no certificate in the system Root store is trusted by the default engine\n");
     if (system) CertCloseStore(system, 0);
 
     /* Only the three known config layouts are accepted; the sizes next to each are refused. */
