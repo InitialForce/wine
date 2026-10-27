@@ -5656,19 +5656,13 @@ static DWORD get_default_chain_error(PCCERT_CONTEXT cert)
 /* A root outside the exclusive store is not trusted, even when it is in the chain or the system trusts it. */
 static void test_exclusive_root_rejects_other_roots(void)
 {
-    static const DWORD supported_sizes[] =
-    {
-        FIELD_OFFSET(CERT_CHAIN_ENGINE_CONFIG, hExclusiveRoot),
-        FIELD_OFFSET(CERT_CHAIN_ENGINE_CONFIG, dwExclusiveFlags),
-        sizeof(CERT_CHAIN_ENGINE_CONFIG),
-    };
     CERT_CHAIN_ENGINE_CONFIG config = { 0 };
     HCERTCHAINENGINE engine;
     PCCERT_CONTEXT leaf, system_root;
     HCERTSTORE empty, other_root, chain_root, system;
     FILETIME time;
     DWORD error, size;
-    unsigned int i, j, k;
+    unsigned int i;
     BOOL ret, supported;
 
     empty = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
@@ -5714,26 +5708,25 @@ static void test_exclusive_root_rejects_other_roots(void)
     else skip("no certificate in the system Root store is trusted by the default engine\n");
     if (system) CertCloseStore(system, 0);
 
-    /* Only the three known config layouts are accepted; the sizes next to each are refused. */
-    config.hExclusiveRoot = chain_root;
-    for (i = 0; i < ARRAY_SIZE(supported_sizes); i++)
+    /* Windows accepts the layout without the exclusive stores, or any size from the end of
+     * hExclusiveTrustedPeople up to the full structure, with or without an exclusive root. */
+    for (i = 0; i < 2; i++)
     {
-        for (j = 0; j < 3; j++)
+        for (size = 0; size <= sizeof(config) + 16; size++)
         {
-            size = supported_sizes[i] + j - 1;
-            supported = FALSE;
-            for (k = 0; k < ARRAY_SIZE(supported_sizes); k++) if (size == supported_sizes[k]) supported = TRUE;
-            if (j != 1 && supported) continue;
-
+            supported = size == FIELD_OFFSET(CERT_CHAIN_ENGINE_CONFIG, hExclusiveRoot) ||
+                        (size >= FIELD_OFFSET(CERT_CHAIN_ENGINE_CONFIG, dwExclusiveFlags) && size <= sizeof(config));
+            memset(&config, 0, sizeof(config));
             config.cbSize = size;
+            config.hExclusiveRoot = i ? chain_root : NULL;
             SetLastError(0xdeadbeef);
             engine = NULL;
             ret = CertCreateCertificateChainEngine(&config, &engine);
             if (supported)
-                ok(ret, "size %lu: CertCreateCertificateChainEngine failed: %08lx\n", size, GetLastError());
+                ok(ret, "size %lu, root %u: CertCreateCertificateChainEngine failed: %08lx\n", size, i, GetLastError());
             else
-                ok(!ret && GetLastError() == E_INVALIDARG, "size %lu: got %d, error %08lx\n",
-                   size, ret, GetLastError());
+                ok(!ret && GetLastError() == E_INVALIDARG, "size %lu, root %u: got %d, error %08lx\n",
+                   size, i, ret, GetLastError());
             if (ret) CertFreeCertificateChainEngine(engine);
         }
     }

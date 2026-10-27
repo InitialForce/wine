@@ -252,18 +252,23 @@ BOOL WINAPI CertCreateCertificateChainEngine(PCERT_CHAIN_ENGINE_CONFIG pConfig,
     TRACE("dwUrlRetrievalTimeout %lu\n", pConfig->dwUrlRetrievalTimeout);
     TRACE("MaximumCachedCertificates %lu\n", pConfig->MaximumCachedCertificates);
     TRACE("CycleDetectionModulus %lu\n", pConfig->CycleDetectionModulus);
+    /* Windows accepts the layout without the exclusive stores, or any size from the end of
+     * hExclusiveTrustedPeople up to the full structure. */
     if (pConfig->cbSize != sizeof(CERT_CHAIN_ENGINE_CONFIG_NO_EXCLUSIVE_ROOT) &&
-        pConfig->cbSize != sizeof(CERT_CHAIN_ENGINE_CONFIG_NO_EXCLUSIVE_FLAGS) &&
-        pConfig->cbSize != sizeof(CERT_CHAIN_ENGINE_CONFIG))
+        (pConfig->cbSize < sizeof(CERT_CHAIN_ENGINE_CONFIG_NO_EXCLUSIVE_FLAGS) ||
+         pConfig->cbSize > sizeof(CERT_CHAIN_ENGINE_CONFIG)))
     {
         SetLastError(E_INVALIDARG);
         return FALSE;
     }
 
-    if (pConfig->cbSize == sizeof(CERT_CHAIN_ENGINE_CONFIG))
+    if (pConfig->cbSize >= sizeof(CERT_CHAIN_ENGINE_CONFIG_NO_EXCLUSIVE_FLAGS))
     {
         TRACE("hExclusiveRoot %p\n", pConfig->hExclusiveRoot);
         TRACE("hExclusiveTrustedPeople %p\n", pConfig->hExclusiveTrustedPeople);
+    }
+    if (pConfig->cbSize >= FIELD_OFFSET(CERT_CHAIN_ENGINE_CONFIG, dwExclusiveFlags) + sizeof(DWORD))
+    {
         TRACE("dwExclusiveFlags %lx\n", pConfig->dwExclusiveFlags);
         if (pConfig->dwExclusiveFlags)
             FIXME("dwExclusiveFlags %lx not supported\n", pConfig->dwExclusiveFlags);
