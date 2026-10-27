@@ -418,7 +418,13 @@ SECURITY_STATUS WINAPI NCryptGetProperty(NCRYPT_HANDLE handle, const WCHAR *name
     if (flags) FIXME("flags %#lx not supported\n", flags);
 
     if (!object) return NTE_INVALID_HANDLE;
-    if (!(property = get_object_property(object, name))) return NTE_INVALID_PARAMETER;
+    if (!(property = get_object_property(object, name)))
+    {
+        /* A key from a blob with a P-256 magic has no curve name property on Windows. */
+        if (object->type == KEY && object->key.algid == ECDSA_P256 && !wcscmp(name, BCRYPT_ECC_CURVE_NAME))
+            return NTE_NOT_FOUND;
+        return NTE_INVALID_PARAMETER;
+    }
 
     *result = property->value_size;
     if (!output) return ERROR_SUCCESS;
@@ -430,41 +436,59 @@ SECURITY_STATUS WINAPI NCryptGetProperty(NCRYPT_HANDLE handle, const WCHAR *name
     return ERROR_SUCCESS;
 }
 
-/* .NET's ECDsaCng.ImportParameters passes the curve name of a named-curve key as the only parameter.
- * Returns NTE_INVALID_PARAMETER for a malformed descriptor and NTE_NOT_SUPPORTED for anything but a P-256 name. */
-static SECURITY_STATUS check_p256_curve_params(const NCryptBufferDesc *params)
+/* The named curves CNG knows. */
+static const WCHAR *const known_curves[] =
 {
-    ULONG i, j;
+    L"brainpoolP160r1", L"brainpoolP160t1", L"brainpoolP192r1", L"brainpoolP192t1", L"brainpoolP224r1",
+    L"brainpoolP224t1", L"brainpoolP256r1", L"brainpoolP256t1", L"brainpoolP320r1", L"brainpoolP320t1",
+    L"brainpoolP384r1", L"brainpoolP384t1", L"brainpoolP512r1", L"brainpoolP512t1", L"curve25519",
+    L"ec192wapi", L"nistP192", L"nistP224", L"nistP256", L"nistP384", L"nistP521", L"numsP256t1",
+    L"numsP384t1", L"numsP512t1", L"secP160k1", L"secP160r1", L"secP160r2", L"secP192k1", L"secP192r1",
+    L"secP224k1", L"secP224r1", L"secP256k1", L"secP256r1", L"secP384r1", L"secP521r1", L"wtls12", L"wtls7",
+    L"wtls9", L"x962P192v1", L"x962P192v2", L"x962P192v3", L"x962P239v1", L"x962P239v2", L"x962P239v3",
+    L"x962P256v1",
+};
 
-    if (params->ulVersion != NCRYPTBUFFER_VERSION) return NTE_INVALID_PARAMETER;
-    if (params->cBuffers && !params->pBuffers) return NTE_INVALID_PARAMETER;
-    if (!params->cBuffers) return NTE_NOT_SUPPORTED;
+/* A generic ECC blob names its curve in the parameters, as .NET's ECDsaCng.ImportParameters passes it.
+ * A missing or malformed name, or a known curve other than P-256, gives NTE_NOT_SUPPORTED, as on Windows;
+ * an unknown curve name gives NTE_INVALID_PARAMETER. */
+static SECURITY_STATUS check_generic_curve_params(const NCryptBufferDesc *params)
+{
+    const NCryptBuffer *buffer = NULL;
+    const WCHAR *name;
+    ULONG i, len;
+
+    if (!params || params->ulVersion != NCRYPTBUFFER_VERSION || !params->cBuffers || !params->pBuffers)
+        return NTE_NOT_SUPPORTED;
     for (i = 0; i < params->cBuffers; i++)
     {
-        const NCryptBuffer *buffer = &params->pBuffers[i];
-        const WCHAR *name = buffer->pvBuffer;
-
-        if (buffer->BufferType != NCRYPTBUFFER_ECC_CURVE_NAME) return NTE_NOT_SUPPORTED;
-        if (!name || !buffer->cbBuffer || buffer->cbBuffer % sizeof(WCHAR)) return NTE_INVALID_PARAMETER;
-        for (j = 0; j < buffer->cbBuffer / sizeof(WCHAR); j++) if (!name[j]) break;
-        if (j == buffer->cbBuffer / sizeof(WCHAR)) return NTE_INVALID_PARAMETER;
-        if (lstrcmpiW(name, BCRYPT_ECC_CURVE_NISTP256) && lstrcmpiW(name, BCRYPT_ECC_CURVE_SECP256R1))
-            return NTE_NOT_SUPPORTED;
+        if (params->pBuffers[i].BufferType != NCRYPTBUFFER_ECC_CURVE_NAME) continue;
+        buffer = &params->pBuffers[i];
+        break;
     }
+    if (!buffer || !(name = buffer->pvBuffer) || !buffer->cbBuffer || buffer->cbBuffer % sizeof(WCHAR))
+        return NTE_NOT_SUPPORTED;
+    for (len = 0; len < buffer->cbBuffer / sizeof(WCHAR); len++) if (!name[len]) break;
+    if (len == buffer->cbBuffer / sizeof(WCHAR)) return NTE_NOT_SUPPORTED;
+
+    for (i = 0; i < ARRAY_SIZE(known_curves); i++) if (!lstrcmpiW(name, known_curves[i])) break;
+    if (i == ARRAY_SIZE(known_curves)) return NTE_INVALID_PARAMETER;
+    if (lstrcmpiW(name, BCRYPT_ECC_CURVE_NISTP256) && lstrcmpiW(name, BCRYPT_ECC_CURVE_SECP256R1) &&
+        lstrcmpiW(name, L"x962P256v1"))
+        return NTE_NOT_SUPPORTED;
     return ERROR_SUCCESS;
 }
 
-/* An ECC blob is accepted only under a blob type of the same kind as its magic: the ECC type or the
- * generic alias. */
-static BOOL ecc_blob_type_matches(const WCHAR *type, BOOL private)
+static BOOL is_rsa_blob_type(const WCHAR *type)
 {
-    if (!type) return FALSE;
-    if (private) return !wcscmp(type, BCRYPT_ECCPRIVATE_BLOB) || !wcscmp(type, BCRYPT_PRIVATE_KEY_BLOB);
-    return !wcscmp(type, BCRYPT_ECCPUBLIC_BLOB) || !wcscmp(type, BCRYPT_PUBLIC_KEY_BLOB);
+    return !wcscmp(type, BCRYPT_RSAPUBLIC_BLOB) || !wcscmp(type, BCRYPT_RSAPRIVATE_BLOB) ||
+           !wcscmp(type, BCRYPT_RSAFULLPRIVATE_BLOB);
 }
 
-static SECURITY_STATUS import_ecdsa_p256(NCRYPT_PROV_HANDLE provider, BOOL private, BYTE *data, DWORD datasize,
-                                         struct object **ret_object)
+/* Imports a P-256 key from a blob with a P-256 magic. A key imported from a generic blob reports the
+ * algorithm "ECDSA" and its curve name, as on Windows. */
+static SECURITY_STATUS import_ecdsa_p256(NCRYPT_PROV_HANDLE provider, BOOL private, BOOL generic, BYTE *data,
+                                         DWORD datasize, struct object **ret_object)
 {
     struct object *object;
     SECURITY_STATUS ret;
@@ -487,9 +511,34 @@ static SECURITY_STATUS import_ecdsa_p256(NCRYPT_PROV_HANDLE provider, BOOL priva
         return map_ntstatus(status);
     }
 
+    if (generic &&
+        ((ret = set_object_property(object, NCRYPT_ALGORITHM_PROPERTY, (BYTE *)BCRYPT_ECDSA_ALGORITHM,
+                                    sizeof(BCRYPT_ECDSA_ALGORITHM))) ||
+         (ret = set_object_property(object, BCRYPT_ECC_CURVE_NAME, (BYTE *)BCRYPT_ECC_CURVE_NISTP256,
+                                    sizeof(BCRYPT_ECC_CURVE_NISTP256)))))
+    {
+        BCryptDestroyKey(object->key.bcrypt_key);
+        free_object(object);
+        return ret;
+    }
     if ((ret = set_key_length(object, bitlen))) return ret;
     *ret_object = object;
     return ERROR_SUCCESS;
+}
+
+/* The status Windows returns for a P-256 blob under the given blob type, or ERROR_SUCCESS. */
+static SECURITY_STATUS check_p256_blob_type(const WCHAR *type, BOOL private)
+{
+    if (!type) return NTE_INVALID_PARAMETER;
+    if (is_rsa_blob_type(type)) return NTE_BAD_DATA;
+    if (private)
+    {
+        if (!wcscmp(type, BCRYPT_ECCPRIVATE_BLOB) || !wcscmp(type, BCRYPT_PRIVATE_KEY_BLOB)) return ERROR_SUCCESS;
+        return NTE_INVALID_PARAMETER;
+    }
+    if (!wcscmp(type, BCRYPT_ECCPUBLIC_BLOB) || !wcscmp(type, BCRYPT_PUBLIC_KEY_BLOB)) return ERROR_SUCCESS;
+    if (!wcscmp(type, BCRYPT_PRIVATE_KEY_BLOB) || !wcscmp(type, BCRYPT_ECCPRIVATE_BLOB)) return NTE_NOT_SUPPORTED;
+    return NTE_INVALID_PARAMETER;
 }
 
 SECURITY_STATUS WINAPI NCryptImportKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_HANDLE decrypt_key,
@@ -498,7 +547,6 @@ SECURITY_STATUS WINAPI NCryptImportKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_H
 {
     BCRYPT_KEY_BLOB *header = (BCRYPT_KEY_BLOB *)data;
     struct object *object;
-    SECURITY_STATUS params_status;
 
     TRACE("(%#Ix, %#Ix, %s, %p, %p, %p, %lu, %#lx)\n", provider, decrypt_key, wine_dbgstr_w(type),
           params, handle, data, datasize, flags);
@@ -507,12 +555,6 @@ SECURITY_STATUS WINAPI NCryptImportKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_H
     {
         FIXME("Key blob decryption not implemented\n");
         return NTE_NOT_SUPPORTED;
-    }
-    if (params && (params_status = check_p256_curve_params(params)))
-    {
-        if (params_status == NTE_NOT_SUPPORTED) FIXME("Parameter information not implemented\n");
-        else WARN("Invalid parameters\n");
-        return params_status;
     }
     if (flags == NCRYPT_SILENT_FLAG)
     {
@@ -563,40 +605,49 @@ SECURITY_STATUS WINAPI NCryptImportKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_H
     case BCRYPT_ECDSA_PRIVATE_P256_MAGIC:
     case BCRYPT_ECDSA_PUBLIC_P256_MAGIC:
     {
+        /* Windows ignores the parameters for a blob that names its curve in the magic. */
         BOOL private = header->Magic == BCRYPT_ECDSA_PRIVATE_P256_MAGIC;
         SECURITY_STATUS ret;
 
-        if (!ecc_blob_type_matches(type, private))
+        if ((ret = check_p256_blob_type(type, private)))
         {
-            WARN("Blob type %s does not match magic %#lx\n", wine_dbgstr_w(type), header->Magic);
-            return NTE_INVALID_PARAMETER;
+            WARN("Blob type %s does not fit magic %#lx\n", wine_dbgstr_w(type), header->Magic);
+            return ret;
         }
-        ret = import_ecdsa_p256(provider, private, data, datasize, &object);
+        ret = import_ecdsa_p256(provider, private, FALSE, data, datasize, &object);
         if (ret != ERROR_SUCCESS) return ret;
         break;
     }
     case BCRYPT_ECDSA_PRIVATE_GENERIC_MAGIC:
     case BCRYPT_ECDSA_PUBLIC_GENERIC_MAGIC:
     {
-        /* A generic blob names its curve in params; only P-256 is supported. */
         BCRYPT_ECCKEY_BLOB *copy;
         SECURITY_STATUS ret;
         BOOL private = header->Magic == BCRYPT_ECDSA_PRIVATE_GENERIC_MAGIC;
+        DWORD public_size, size = datasize;
 
-        if (!ecc_blob_type_matches(type, private))
+        if (!type) return NTE_INVALID_PARAMETER;
+        if (is_rsa_blob_type(type)) return NTE_BAD_DATA;
+        if ((ret = check_generic_curve_params(params)))
         {
-            WARN("Blob type %s does not match magic %#lx\n", wine_dbgstr_w(type), header->Magic);
-            return NTE_INVALID_PARAMETER;
+            WARN("Unsupported curve parameters for a generic ECDSA blob\n");
+            return ret;
         }
-        if (!params || datasize < sizeof(*copy) || ((BCRYPT_ECCKEY_BLOB *)data)->cbKey != 32)
+        /* Windows imports a generic private blob as a public one under BCRYPT_ECCPUBLIC_BLOB. Whether it keeps
+         * the private part is not known; this keeps only the public part. */
+        if (!wcscmp(type, BCRYPT_ECCPUBLIC_BLOB)) private = FALSE;
+        else if (!private || wcscmp(type, BCRYPT_ECCPRIVATE_BLOB))
         {
-            FIXME("Unsupported generic ECDSA key\n");
+            WARN("Blob type %s does not fit magic %#lx\n", wine_dbgstr_w(type), header->Magic);
             return NTE_NOT_SUPPORTED;
         }
-        if (!(copy = malloc(datasize))) return NTE_NO_MEMORY;
-        memcpy(copy, data, datasize);
+        if (datasize < sizeof(*copy) || ((BCRYPT_ECCKEY_BLOB *)data)->cbKey != 32) return NTE_NOT_SUPPORTED;
+        public_size = sizeof(*copy) + 2 * 32;
+        if (!private && size > public_size) size = public_size;
+        if (!(copy = malloc(size))) return NTE_NO_MEMORY;
+        memcpy(copy, data, size);
         copy->dwMagic = private ? BCRYPT_ECDSA_PRIVATE_P256_MAGIC : BCRYPT_ECDSA_PUBLIC_P256_MAGIC;
-        ret = import_ecdsa_p256(provider, private, (BYTE *)copy, datasize, &object);
+        ret = import_ecdsa_p256(provider, private, TRUE, (BYTE *)copy, size, &object);
         free(copy);
         if (ret != ERROR_SUCCESS) return ret;
         break;
