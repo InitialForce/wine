@@ -485,15 +485,26 @@ static BOOL is_rsa_blob_type(const WCHAR *type)
            !wcscmp(type, BCRYPT_RSAFULLPRIVATE_BLOB);
 }
 
+/* The number of bits in a big-endian number, counted from its first non-zero bit. */
+static DWORD bit_length(const BYTE *value, DWORD size)
+{
+    DWORD i, bits;
+    BYTE top;
+
+    for (i = 0; i < size; i++) if (value[i]) break;
+    if (i == size) return 0;
+    for (top = value[i], bits = 0; top; top >>= 1) bits++;
+    return (size - i - 1) * 8 + bits;
+}
+
 /* Imports a P-256 key from a blob with a P-256 magic. A key imported from a generic blob reports the
- * algorithm "ECDSA" and its curve name, as on Windows. */
-static SECURITY_STATUS import_ecdsa_p256(NCRYPT_PROV_HANDLE provider, BOOL private, BOOL generic, BYTE *data,
-                                         DWORD datasize, struct object **ret_object)
+ * algorithm "ECDSA" and its curve name, as on Windows. bitlen is the key length the key reports. */
+static SECURITY_STATUS import_ecdsa_p256(NCRYPT_PROV_HANDLE provider, BOOL private, BOOL generic, DWORD bitlen,
+                                         BYTE *data, DWORD datasize, struct object **ret_object)
 {
     struct object *object;
     SECURITY_STATUS ret;
     NTSTATUS status;
-    DWORD bitlen = 256;
 
     if (!(object = create_key_object(ECDSA_P256, provider)))
     {
@@ -614,7 +625,7 @@ SECURITY_STATUS WINAPI NCryptImportKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_H
             WARN("Blob type %s does not fit magic %#lx\n", wine_dbgstr_w(type), header->Magic);
             return ret;
         }
-        ret = import_ecdsa_p256(provider, private, FALSE, data, datasize, &object);
+        ret = import_ecdsa_p256(provider, private, FALSE, 256, data, datasize, &object);
         if (ret != ERROR_SUCCESS) return ret;
         break;
     }
@@ -624,7 +635,7 @@ SECURITY_STATUS WINAPI NCryptImportKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_H
         BCRYPT_ECCKEY_BLOB *copy;
         SECURITY_STATUS ret;
         BOOL private = header->Magic == BCRYPT_ECDSA_PRIVATE_GENERIC_MAGIC;
-        DWORD public_size, size = datasize;
+        DWORD public_size, size = datasize, bitlen = 256;
 
         if (!type) return NTE_INVALID_PARAMETER;
         if (is_rsa_blob_type(type)) return NTE_BAD_DATA;
@@ -647,7 +658,9 @@ SECURITY_STATUS WINAPI NCryptImportKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_H
         if (!(copy = malloc(size))) return NTE_NO_MEMORY;
         memcpy(copy, data, size);
         copy->dwMagic = private ? BCRYPT_ECDSA_PRIVATE_P256_MAGIC : BCRYPT_ECDSA_PUBLIC_P256_MAGIC;
-        ret = import_ecdsa_p256(provider, private, TRUE, (BYTE *)copy, size, &object);
+        /* Windows reports the bit length of X as the length of a key from a generic private blob. */
+        if (private && size >= sizeof(*copy) + 32) bitlen = bit_length((BYTE *)(copy + 1), 32);
+        ret = import_ecdsa_p256(provider, private, TRUE, bitlen, (BYTE *)copy, size, &object);
         free(copy);
         if (ret != ERROR_SUCCESS) return ret;
         break;
