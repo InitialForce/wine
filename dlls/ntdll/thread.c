@@ -476,6 +476,13 @@ static void unlock_fls_data(void)
     RtlLeaveCriticalSection( &fls_section );
 }
 
+/* An FLS callback that a thread which is ending runs after it releases the FLS lock. */
+struct fls_pending_callback
+{
+    PFLS_CALLBACK_FUNCTION callback;
+    void                  *data;
+};
+
 static unsigned int fls_chunk_size( unsigned int chunk_index )
 {
     return 0x10 << chunk_index;
@@ -692,7 +699,27 @@ void WINAPI DECLSPEC_HOTPATCH RtlProcessFlsData( void *teb_fls_data, ULONG flags
 
     if (flags & 1)
     {
+        struct fls_pending_callback *pending = NULL;
+        unsigned int count = 0, n = 0;
+
         lock_fls_data();
+
+        /* The callbacks may wait, and a thread that is starting takes the FLS lock while it holds
+         * the loader lock, so they run after the lock is released. Under the lock, the thread
+         * leaves the list, so RtlFlsFree no longer calls callbacks for it, and the callback of
+         * each value is taken now, so an index freed and allocated again meanwhile is not
+         * given an old value. Without memory for that, they run under the lock as before. */
+        for (i = 0; i < ARRAY_SIZE(fls->fls_data_chunks); ++i)
+        {
+            if (!fls->fls_data_chunks[i] || !fls_data.fls_callback_chunks[i]
+                    || !fls_data.fls_callback_chunks[i]->count)
+                continue;
+            for (index = 0; index < fls_chunk_size( i ); ++index)
+                if (fls->fls_data_chunks[i][index + 1]) ++count;
+        }
+        if (count && !(pending = RtlAllocateHeap( GetProcessHeap(), 0, count * sizeof(*pending) )))
+            count = 0;
+
         for (i = 0; i < ARRAY_SIZE(fls->fls_data_chunks); ++i)
         {
             if (!fls->fls_data_chunks[i] || !fls_data.fls_callback_chunks[i]
@@ -702,16 +729,22 @@ void WINAPI DECLSPEC_HOTPATCH RtlProcessFlsData( void *teb_fls_data, ULONG flags
             for (index = 0; index < fls_chunk_size( i ); ++index)
             {
                 PFLS_CALLBACK_FUNCTION callback = fls_data.fls_callback_chunks[i]->callbacks[index].callback;
+                void *data = fls->fls_data_chunks[i][index + 1];
 
-                if (!fls->fls_data_chunks[i][index + 1])
+                if (!data)
                     continue;
 
                 if (callback && callback != (void *)~(ULONG_PTR)0)
                 {
-                    TRACE_(relay)("Calling FLS callback %p, arg %p.\n", callback,
-                            fls->fls_data_chunks[i][index + 1]);
-
-                    callback( fls->fls_data_chunks[i][index + 1] );
+                    if (pending)
+                    {
+                        pending[n].callback = callback;
+                        pending[n].data = data;
+                        ++n;
+                        continue;
+                    }
+                    TRACE_(relay)("Calling FLS callback %p, arg %p.\n", callback, data);
+                    callback( data );
                 }
                 fls->fls_data_chunks[i][index + 1] = NULL;
             }
@@ -720,6 +753,21 @@ void WINAPI DECLSPEC_HOTPATCH RtlProcessFlsData( void *teb_fls_data, ULONG flags
         fls->fls_list_entry.Flink->Blink = fls->fls_list_entry.Blink;
         fls->fls_list_entry.Blink->Flink = fls->fls_list_entry.Flink;
         unlock_fls_data();
+
+        if (pending)
+        {
+            /* The values stay set while the callbacks run, so FlsGetValue still returns them.
+             * The thread is off the list, so no other thread reads or clears them now. */
+            for (i = 0; i < n; ++i)
+            {
+                TRACE_(relay)("Calling FLS callback %p, arg %p.\n", pending[i].callback, pending[i].data);
+                pending[i].callback( pending[i].data );
+            }
+            for (i = 0; i < ARRAY_SIZE(fls->fls_data_chunks); ++i)
+                if (fls->fls_data_chunks[i])
+                    memset( fls->fls_data_chunks[i] + 1, 0, fls_chunk_size( i ) * sizeof(void *) );
+            RtlFreeHeap( GetProcessHeap(), 0, pending );
+        }
     }
 
     if (flags & 2)

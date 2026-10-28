@@ -1028,6 +1028,79 @@ static void test_fiber_actctx(void)
 }
 
 
+static HANDLE fls_callback_entered_event, fls_callback_release_event;
+static DWORD fls_blocking_index;
+static void *fls_blocking_seen_value;
+static LONG fls_blocking_calls;
+
+static void WINAPI fls_blocking_callback(void *arg)
+{
+    if (arg != (void *)1) return;
+    InterlockedIncrement(&fls_blocking_calls);
+    fls_blocking_seen_value = pFlsGetValue(fls_blocking_index);
+    SetEvent(fls_callback_entered_event);
+    WaitForSingleObject(fls_callback_release_event, 30000);
+}
+
+static DWORD CALLBACK fls_blocking_thread(void *arg)
+{
+    pFlsSetValue(fls_blocking_index, (void *)1);
+    return 0;
+}
+
+static DWORD CALLBACK fls_empty_thread(void *arg)
+{
+    return 0;
+}
+
+static void test_fls_callback_does_not_block_threads(void)
+{
+    HANDLE thread, thread2;
+    DWORD ret;
+
+    if (!pFlsAlloc || !pFlsFree || !pFlsGetValue || !pFlsSetValue)
+    {
+        win_skip("Fiber Local Storage not supported\n");
+        return;
+    }
+
+    /* A thread that is ending runs its FLS callbacks. While one of them waits, other threads
+     * can still start, which needs FLS data and the loader lock. */
+    fls_callback_entered_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    ok(!!fls_callback_entered_event, "CreateEvent failed with error %lu\n", GetLastError());
+    fls_callback_release_event = CreateEventA(NULL, TRUE, FALSE, NULL);
+    ok(!!fls_callback_release_event, "CreateEvent failed with error %lu\n", GetLastError());
+    if (!fls_callback_entered_event || !fls_callback_release_event) return;
+
+    fls_blocking_index = pFlsAlloc(fls_blocking_callback);
+    ok(fls_blocking_index != FLS_OUT_OF_INDEXES, "FlsAlloc failed with error %lu\n", GetLastError());
+    fls_blocking_seen_value = NULL;
+    fls_blocking_calls = 0;
+
+    thread = CreateThread(NULL, 0, fls_blocking_thread, NULL, 0, NULL);
+    ok(!!thread, "CreateThread failed with error %lu\n", GetLastError());
+    ret = WaitForSingleObject(fls_callback_entered_event, 30000);
+    ok(ret == WAIT_OBJECT_0, "FLS callback did not run, ret %lu\n", ret);
+    ok(fls_blocking_seen_value == (void *)1, "FlsGetValue in the callback returned %p\n", fls_blocking_seen_value);
+
+    thread2 = CreateThread(NULL, 0, fls_empty_thread, NULL, 0, NULL);
+    ok(!!thread2, "CreateThread failed with error %lu\n", GetLastError());
+    ret = WaitForSingleObject(thread2, 30000);
+    ok(ret == WAIT_OBJECT_0, "new thread did not finish while an FLS callback waited, ret %lu\n", ret);
+
+    SetEvent(fls_callback_release_event);
+    ret = WaitForSingleObject(thread, 30000);
+    ok(ret == WAIT_OBJECT_0, "thread did not end, ret %lu\n", ret);
+    ok(fls_blocking_calls == 1, "FLS callback ran %ld times\n", fls_blocking_calls);
+    CloseHandle(thread);
+    CloseHandle(thread2);
+
+    ok(pFlsFree(fls_blocking_index), "FlsFree failed with error %lu\n", GetLastError());
+    ok(fls_blocking_calls == 1, "FLS callback ran %ld times after FlsFree\n", fls_blocking_calls);
+    CloseHandle(fls_callback_entered_event);
+    CloseHandle(fls_callback_release_event);
+}
+
 static void WINAPI fls_exit_deadlock_callback(void *arg)
 {
     if (arg == (void *)1)
@@ -1112,4 +1185,5 @@ START_TEST(fiber)
     test_FiberLocalStorageWithFibers(FiberLocalStorageProc);
     test_fiber_actctx();
     test_fls_exit_deadlock();
+    test_fls_callback_does_not_block_threads();
 }
