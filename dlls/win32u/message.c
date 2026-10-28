@@ -2251,6 +2251,13 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
         default:
             send_message( hwnd, WM_SYSCOMMAND, LOWORD(state_cmd), 0 );
             break;
+        case SC_MAXIMIZE:
+            send_message( hwnd, WM_SYSCOMMAND, SC_MAXIMIZE, 0 );
+            /* the host maximized the window: use its geometry rather than the one maximizing computed */
+            if (swp_flags && is_zoomed( hwnd ))
+                NtUserSetWindowPos( hwnd, 0, window_rect.left, window_rect.top, window_rect.right - window_rect.left,
+                                    window_rect.bottom - window_rect.top, swp_flags & ~(SWP_NOMOVE | SWP_NOSIZE) );
+            break;
         case 0:
             if (!swp_flags) break;
             NtUserSetWindowPos( hwnd, 0, window_rect.left, window_rect.top, window_rect.right - window_rect.left,

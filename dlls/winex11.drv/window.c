@@ -1411,6 +1411,15 @@ static void window_set_net_wm_state( struct x11drv_win_data *data, UINT new_stat
     }
 }
 
+/* the window manager decides the geometry of a managed window it maximizes, as it knows about
+ * panels and docks that the work area may not describe */
+static BOOL window_has_wm_maximized_geometry( struct x11drv_win_data *data, UINT net_wm_state )
+{
+    if (!data->managed || data->embedded || data->whole_window == root_window || is_virtual_desktop()) return FALSE;
+    if (net_wm_state & (1 << NET_WM_STATE_FULLSCREEN)) return FALSE;
+    return !!(net_wm_state & (1 << NET_WM_STATE_MAXIMIZED));
+}
+
 static void window_set_config( struct x11drv_win_data *data, RECT rect, BOOL above )
 {
     const RECT *old_rect = &data->pending_state.rect;
@@ -1429,6 +1438,8 @@ static void window_set_config( struct x11drv_win_data *data, RECT rect, BOOL abo
     data->desired_state.above = above;
     if (data->state_locks) return; /* win32 state is being updated, delay the change */
     if (!data->whole_window) return; /* no window, nothing to update */
+    if (window_has_wm_maximized_geometry( data, data->desired_state.net_wm_state ))
+        *new_rect = *old_rect; /* keep the window manager geometry, only change the stacking */
     if (EqualRect( old_rect, new_rect ) && (old_above || !above || data->managed)) return; /* rects are the same, no need to be raised, nothing to update */
     if (window_needs_config_change_delay( data ))
     {
@@ -1766,8 +1777,9 @@ static UINT window_update_client_config( struct x11drv_win_data *data )
      * adding __NET_WM_STATE_FULLSCREEN will make WMs move the window to cover exactly the monitor
      * rect. If the application sets a visible rect slightly larger than the monitor rect and insists
      * on changing to the rect that it previously set when the rect is changed by the WM, then the
-     * window rect will be repeatedly changed by the WM and the application, causing a flickering effect */
-    if (data->is_fullscreen)
+     * window rect will be repeatedly changed by the WM and the application, causing a flickering effect.
+     * A window the WM maximized takes the WM geometry instead. */
+    if (data->is_fullscreen && !window_has_wm_maximized_geometry( data, data->current_state.net_wm_state ))
     {
         if (xinerama_get_fullscreen_monitors( &data->rects.visible, &old_generation, old_monitors )
             && xinerama_get_fullscreen_monitors( &data->current_state.rect, &generation, monitors )
