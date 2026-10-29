@@ -1028,6 +1028,204 @@ static void test_fiber_actctx(void)
 }
 
 
+static HANDLE fls_callback_entered_event, fls_callback_release_event, fls_free_started_event;
+static DWORD fls_blocking_index;
+static void *fls_blocking_seen_value;
+static LONG fls_blocking_calls;
+static volatile DWORD fls_blocking_wait_result;
+
+static void WINAPI fls_blocking_callback(void *arg)
+{
+    if (arg != (void *)1) return;
+    InterlockedIncrement(&fls_blocking_calls);
+    fls_blocking_seen_value = pFlsGetValue(fls_blocking_index);
+    SetEvent(fls_callback_entered_event);
+    /* Longer than the main thread waits for the second thread, so the callback is still
+     * waiting when that wait ends. The timeout only keeps a broken run from hanging. */
+    fls_blocking_wait_result = WaitForSingleObject(fls_callback_release_event, 60000);
+}
+
+static DWORD CALLBACK fls_blocking_thread(void *arg)
+{
+    pFlsSetValue(fls_blocking_index, (void *)1);
+    return 0;
+}
+
+static DWORD CALLBACK fls_empty_thread(void *arg)
+{
+    return 0;
+}
+
+static DWORD CALLBACK fls_free_thread(void *arg)
+{
+    SetEvent(fls_free_started_event);
+    return pFlsFree(fls_blocking_index) ? 1 : 2;
+}
+
+/* Waits for a thread to end and checks its exit code. Returns FALSE if it is still running. */
+static BOOL join_fls_thread(HANDLE thread, DWORD timeout, DWORD expected, const char *name)
+{
+    DWORD ret, code = STILL_ACTIVE;
+
+    ret = WaitForSingleObject(thread, timeout);
+    ok(ret == WAIT_OBJECT_0, "%s did not end, ret %lu\n", name, ret);
+    if (ret != WAIT_OBJECT_0) return FALSE;
+    ok(GetExitCodeThread(thread, &code), "GetExitCodeThread failed with error %lu\n", GetLastError());
+    ok(code == expected, "%s exit code %lu\n", name, code);
+    return TRUE;
+}
+
+static void test_fls_callback_does_not_block_threads(void)
+{
+    HANDLE thread = NULL, thread2 = NULL, free_thread = NULL;
+    BOOL index_freed = FALSE;
+    DWORD ret;
+
+    if (!pFlsAlloc || !pFlsFree || !pFlsGetValue || !pFlsSetValue)
+    {
+        win_skip("Fiber Local Storage not supported\n");
+        return;
+    }
+
+    /* A thread that is ending runs its FLS callbacks. While one of them waits, other threads
+     * can still start, which needs FLS data and the loader lock. */
+    fls_callback_entered_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    ok(!!fls_callback_entered_event, "CreateEvent failed with error %lu\n", GetLastError());
+    fls_callback_release_event = CreateEventA(NULL, TRUE, FALSE, NULL);
+    ok(!!fls_callback_release_event, "CreateEvent failed with error %lu\n", GetLastError());
+    fls_free_started_event = CreateEventA(NULL, TRUE, FALSE, NULL);
+    ok(!!fls_free_started_event, "CreateEvent failed with error %lu\n", GetLastError());
+    if (!fls_callback_entered_event || !fls_callback_release_event || !fls_free_started_event) goto done;
+
+    fls_blocking_index = pFlsAlloc(fls_blocking_callback);
+    ok(fls_blocking_index != FLS_OUT_OF_INDEXES, "FlsAlloc failed with error %lu\n", GetLastError());
+    if (fls_blocking_index == FLS_OUT_OF_INDEXES) goto done;
+    fls_blocking_seen_value = NULL;
+    fls_blocking_calls = 0;
+    fls_blocking_wait_result = ~0u;
+
+    thread = CreateThread(NULL, 0, fls_blocking_thread, NULL, 0, NULL);
+    ok(!!thread, "CreateThread failed with error %lu\n", GetLastError());
+    if (!thread) goto free_index;
+    ret = WaitForSingleObject(fls_callback_entered_event, 10000);
+    ok(ret == WAIT_OBJECT_0, "FLS callback did not run, ret %lu\n", ret);
+    if (ret != WAIT_OBJECT_0) goto release;
+    ok(fls_blocking_seen_value == (void *)1, "FlsGetValue in the callback returned %p\n", fls_blocking_seen_value);
+
+    thread2 = CreateThread(NULL, 0, fls_empty_thread, NULL, 0, NULL);
+    ok(!!thread2, "CreateThread failed with error %lu\n", GetLastError());
+    if (thread2)
+    {
+        ret = WaitForSingleObject(thread2, 10000);
+        ok(ret == WAIT_OBJECT_0, "new thread did not finish while an FLS callback waited, ret %lu\n", ret);
+    }
+
+    /* FlsFree of the index waits until the callback returns. */
+    free_thread = CreateThread(NULL, 0, fls_free_thread, NULL, 0, NULL);
+    ok(!!free_thread, "CreateThread failed with error %lu\n", GetLastError());
+    if (free_thread)
+    {
+        ret = WaitForSingleObject(fls_free_started_event, 10000);
+        ok(ret == WAIT_OBJECT_0, "FlsFree thread did not start, ret %lu\n", ret);
+        if (ret == WAIT_OBJECT_0)
+        {
+            ret = WaitForSingleObject(free_thread, 500);
+            ok(ret == WAIT_TIMEOUT, "FlsFree did not wait for the running callback, ret %lu\n", ret);
+        }
+    }
+    ok(fls_blocking_wait_result == ~0u, "FLS callback stopped waiting before it was released, ret %lu\n",
+       fls_blocking_wait_result);
+
+release:
+    SetEvent(fls_callback_release_event);
+    /* A thread that is still running may use the index or the events, so leave them. */
+    if (!join_fls_thread(thread, 70000, 0, "thread")) return;
+    CloseHandle(thread);
+    ok(fls_blocking_wait_result == WAIT_OBJECT_0, "FLS callback wait returned %lu\n", fls_blocking_wait_result);
+    ok(fls_blocking_calls == 1, "FLS callback ran %ld times\n", fls_blocking_calls);
+    if (thread2)
+    {
+        if (!join_fls_thread(thread2, 70000, 0, "new thread")) return;
+        CloseHandle(thread2);
+    }
+    if (free_thread)
+    {
+        if (!join_fls_thread(free_thread, 10000, 1, "FlsFree thread")) return;
+        CloseHandle(free_thread);
+        ok(fls_blocking_calls == 1, "FLS callback ran %ld times after FlsFree\n", fls_blocking_calls);
+        index_freed = TRUE;
+    }
+
+free_index:
+    if (!index_freed)
+    {
+        ok(pFlsFree(fls_blocking_index), "FlsFree failed with error %lu\n", GetLastError());
+        ok(fls_blocking_calls == !!thread, "FLS callback ran %ld times after FlsFree\n", fls_blocking_calls);
+    }
+
+done:
+    if (fls_callback_entered_event) CloseHandle(fls_callback_entered_event);
+    if (fls_callback_release_event) CloseHandle(fls_callback_release_event);
+    if (fls_free_started_event) CloseHandle(fls_free_started_event);
+}
+
+static DWORD fls_first_index, fls_second_index;
+static void *fls_second_arg;
+static LONG fls_first_calls, fls_second_calls;
+
+static void WINAPI fls_first_callback(void *arg)
+{
+    InterlockedIncrement(&fls_first_calls);
+    pFlsSetValue(fls_second_index, (void *)0x22);
+}
+
+static void WINAPI fls_second_callback(void *arg)
+{
+    InterlockedIncrement(&fls_second_calls);
+    fls_second_arg = arg;
+}
+
+static DWORD CALLBACK fls_replace_thread(void *arg)
+{
+    pFlsSetValue(fls_first_index, (void *)0x11);
+    pFlsSetValue(fls_second_index, (void *)0x21);
+    return 0;
+}
+
+static void test_fls_callback_replaces_value(void)
+{
+    HANDLE thread;
+
+    if (!pFlsAlloc || !pFlsFree || !pFlsSetValue)
+    {
+        win_skip("Fiber Local Storage not supported\n");
+        return;
+    }
+
+    /* At thread exit, a callback that sets a later slot replaces the value that slot's
+     * callback receives. */
+    fls_first_index = pFlsAlloc(fls_first_callback);
+    ok(fls_first_index != FLS_OUT_OF_INDEXES, "FlsAlloc failed with error %lu\n", GetLastError());
+    fls_second_index = pFlsAlloc(fls_second_callback);
+    ok(fls_second_index != FLS_OUT_OF_INDEXES, "FlsAlloc failed with error %lu\n", GetLastError());
+    if (fls_first_index == FLS_OUT_OF_INDEXES || fls_second_index == FLS_OUT_OF_INDEXES) goto done;
+    ok(fls_first_index < fls_second_index, "indices %lu, %lu\n", fls_first_index, fls_second_index);
+
+    thread = CreateThread(NULL, 0, fls_replace_thread, NULL, 0, NULL);
+    ok(!!thread, "CreateThread failed with error %lu\n", GetLastError());
+    if (!thread) goto done;
+    /* A thread that is still running its callbacks would race FlsFree, so leave the indices. */
+    if (!join_fls_thread(thread, 10000, 0, "thread")) return;
+    CloseHandle(thread);
+    ok(fls_first_calls == 1, "first callback ran %ld times\n", fls_first_calls);
+    ok(fls_second_calls == 1, "second callback ran %ld times\n", fls_second_calls);
+    ok(fls_second_arg == (void *)0x22, "second callback got %p\n", fls_second_arg);
+
+done:
+    if (fls_first_index != FLS_OUT_OF_INDEXES) pFlsFree(fls_first_index);
+    if (fls_second_index != FLS_OUT_OF_INDEXES) pFlsFree(fls_second_index);
+}
+
 static void WINAPI fls_exit_deadlock_callback(void *arg)
 {
     if (arg == (void *)1)
@@ -1112,4 +1310,6 @@ START_TEST(fiber)
     test_FiberLocalStorageWithFibers(FiberLocalStorageProc);
     test_fiber_actctx();
     test_fls_exit_deadlock();
+    test_fls_callback_does_not_block_threads();
+    test_fls_callback_replaces_value();
 }
