@@ -476,6 +476,29 @@ static void unlock_fls_data(void)
     RtlLeaveCriticalSection( &fls_section );
 }
 
+/* An FLS callback that a thread runs at exit, outside the FLS lock. */
+struct fls_running_callback
+{
+    LIST_ENTRY entry;
+    ULONG      index;
+    TEB       *teb;
+};
+
+static LIST_ENTRY fls_running_list = { &fls_running_list, &fls_running_list };
+static RTL_CONDITION_VARIABLE fls_running_cv = RTL_CONDITION_VARIABLE_INIT;
+
+static BOOL fls_callback_running( ULONG index )
+{
+    LIST_ENTRY *entry;
+
+    for (entry = fls_running_list.Flink; entry != &fls_running_list; entry = entry->Flink)
+    {
+        struct fls_running_callback *running = CONTAINING_RECORD(entry, struct fls_running_callback, entry);
+        if (running->index == index && running->teb != NtCurrentTeb()) return TRUE;
+    }
+    return FALSE;
+}
+
 static unsigned int fls_chunk_size( unsigned int chunk_index )
 {
     return 0x10 << chunk_index;
@@ -595,6 +618,12 @@ NTSTATUS WINAPI DECLSPEC_HOTPATCH RtlFlsFree( ULONG index )
         return STATUS_INVALID_PARAMETER;
     }
 
+    /* As on Windows, wait while another thread runs this index's callback at its exit. Not
+     * during process shutdown, where that thread may have been killed in the callback, and not
+     * when the lock is held more than once, as the wait would not release it. */
+    while (fls_section.RecursionCount == 1 && !RtlDllShutdownInProgress() && fls_callback_running( index ))
+        RtlSleepConditionVariableCS( &fls_running_cv, &fls_section, NULL );
+
     chunk_index = fls_chunk_index_from_index( index, &idx );
     if (!(chunk = fls_data.fls_callback_chunks[chunk_index])
             || !(callback = chunk->callbacks[idx].callback))
@@ -692,6 +721,8 @@ void WINAPI DECLSPEC_HOTPATCH RtlProcessFlsData( void *teb_fls_data, ULONG flags
 
     if (flags & 1)
     {
+        struct fls_running_callback *running = RtlAllocateHeap( GetProcessHeap(), 0, sizeof(*running) );
+
         lock_fls_data();
         for (i = 0; i < ARRAY_SIZE(fls->fls_data_chunks); ++i)
         {
@@ -702,16 +733,31 @@ void WINAPI DECLSPEC_HOTPATCH RtlProcessFlsData( void *teb_fls_data, ULONG flags
             for (index = 0; index < fls_chunk_size( i ); ++index)
             {
                 PFLS_CALLBACK_FUNCTION callback = fls_data.fls_callback_chunks[i]->callbacks[index].callback;
+                void *data = fls->fls_data_chunks[i][index + 1];
 
-                if (!fls->fls_data_chunks[i][index + 1])
+                if (!data)
                     continue;
 
                 if (callback && callback != (void *)~(ULONG_PTR)0)
                 {
-                    TRACE_(relay)("Calling FLS callback %p, arg %p.\n", callback,
-                            fls->fls_data_chunks[i][index + 1]);
+                    TRACE_(relay)("Calling FLS callback %p, arg %p.\n", callback, data);
 
-                    callback( fls->fls_data_chunks[i][index + 1] );
+                    /* The callback may wait, and a thread that is starting takes the FLS lock
+                     * while it holds the loader lock, so it runs without the lock. The value
+                     * stays set meanwhile, and RtlFlsFree waits for the callback to return.
+                     * Without memory for the record, it runs under the lock as before. */
+                    if (running)
+                    {
+                        running->index = fls_index_from_chunk_index( i, index );
+                        running->teb = NtCurrentTeb();
+                        InsertTailList( &fls_running_list, &running->entry );
+                        unlock_fls_data();
+                        callback( data );
+                        lock_fls_data();
+                        RemoveEntryList( &running->entry );
+                        RtlWakeAllConditionVariable( &fls_running_cv );
+                    }
+                    else callback( data );
                 }
                 fls->fls_data_chunks[i][index + 1] = NULL;
             }
@@ -720,6 +766,7 @@ void WINAPI DECLSPEC_HOTPATCH RtlProcessFlsData( void *teb_fls_data, ULONG flags
         fls->fls_list_entry.Flink->Blink = fls->fls_list_entry.Blink;
         fls->fls_list_entry.Blink->Flink = fls->fls_list_entry.Flink;
         unlock_fls_data();
+        RtlFreeHeap( GetProcessHeap(), 0, running );
     }
 
     if (flags & 2)
