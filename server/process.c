@@ -564,8 +564,12 @@ static void process_sigkill( void *private )
     struct process *process = private;
     int signal = 0;
 
-    process->sigkill_delay *= 2;
-    if (process->sigkill_delay >= TICKS_PER_SEC / 2)
+    /* The unix process may still run native exit code after its last thread is gone, such as
+     * a graphics driver tearing down its device, which can take more than half a second.
+     * Poll at most every 1/8 s and send SIGKILL after about 4 s. */
+    process->sigkill_waited += process->sigkill_delay;
+    if (process->sigkill_delay < TICKS_PER_SEC / 8) process->sigkill_delay *= 2;
+    if (process->sigkill_waited >= TICKS_PER_SEC * 4)
         signal = SIGKILL;
 
     if (!kill( process->unix_pid, signal ) && !signal)
@@ -573,6 +577,7 @@ static void process_sigkill( void *private )
     else
     {
         process->sigkill_delay = TICKS_PER_SEC / 64;
+        process->sigkill_waited = 0;
         process->sigkill_timeout = NULL;
         process_died( process );
     }
@@ -610,6 +615,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->msg_fd          = NULL;
     process->sigkill_timeout = NULL;
     process->sigkill_delay   = TICKS_PER_SEC / 64;
+    process->sigkill_waited  = 0;
     process->machine         = native_machine;
     process->page_size       = get_page_size();
     process->unix_pid        = -1;

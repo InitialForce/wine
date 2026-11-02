@@ -49,6 +49,7 @@ struct process
     unsigned int         session_id;      /* session id */
     struct timeout_user *sigkill_timeout; /* timeout for final SIGKILL */
     timeout_t            sigkill_delay;   /* delay before final SIGKILL */
+    timeout_t            sigkill_waited;  /* time already waited for the unix process to exit */
     unsigned short       machine;         /* client machine type */
     unsigned int         page_size;       /* client page size */
     int                  unix_pid;        /* Unix pid for final SIGKILL */
