@@ -558,6 +558,27 @@ static void process_died( struct process *process )
     if (!--running_processes && shutdown_stage) close_master_socket( 0 );
 }
 
+/* whether the main thread of a unix process has exited while other threads still run */
+static int unix_main_thread_exited( int pid )
+{
+#ifdef __linux__
+    char path[32], buf[256], *p;
+    ssize_t len;
+    int fd;
+
+    snprintf( path, sizeof(path), "/proc/%d/stat", pid );
+    if ((fd = open( path, O_RDONLY )) == -1) return 1;
+    len = read( fd, buf, sizeof(buf) - 1 );
+    close( fd );
+    if (len <= 0) return 1;
+    buf[len] = 0;
+    if (!(p = strrchr( buf, ')' )) || !p[1] || !p[2]) return 1;
+    return p[2] == 'Z';
+#else
+    return 1;
+#endif
+}
+
 /* callback for process sigkill timeout */
 static void process_sigkill( void *private )
 {
@@ -565,11 +586,14 @@ static void process_sigkill( void *private )
     int signal = 0;
 
     /* The unix process may still run native exit code after its last thread is gone, such as
-     * a graphics driver tearing down its device, which can take more than half a second.
-     * Poll at most every 1/8 s and send SIGKILL after about 4 s. */
+     * a graphics driver tearing down its device in exit(), which can take more than half a
+     * second. While its main thread runs, poll at intervals capped at 1/8 s and send SIGKILL
+     * after about 4 s. Once the main thread has exited and only stray threads are left, send
+     * SIGKILL after about half a second, as before. */
     process->sigkill_waited += process->sigkill_delay;
     if (process->sigkill_delay < TICKS_PER_SEC / 8) process->sigkill_delay *= 2;
-    if (process->sigkill_waited >= TICKS_PER_SEC * 4)
+    if (process->sigkill_waited >= TICKS_PER_SEC * 4 ||
+        (process->sigkill_waited >= TICKS_PER_SEC * 15 / 32 && unix_main_thread_exited( process->unix_pid )))
         signal = SIGKILL;
 
     if (!kill( process->unix_pid, signal ) && !signal)
