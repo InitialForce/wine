@@ -542,10 +542,13 @@ void run_dbus_loop(void)
                                        "interface='org.freedesktop.UDisks',"
                                        "sender='org.freedesktop.UDisks'";
     static const char udisks2_match_interfaces[] = "type='signal',"
+                                                   "sender='org.freedesktop.UDisks2',"
                                                    "interface='org.freedesktop.DBus.ObjectManager',"
                                                    "path='/org/freedesktop/UDisks2'";
     static const char udisks2_match_properties[] = "type='signal',"
-                                                   "interface='org.freedesktop.DBus.Properties'";
+                                                   "sender='org.freedesktop.UDisks2',"
+                                                   "interface='org.freedesktop.DBus.Properties',"
+                                                   "path_namespace='/org/freedesktop/UDisks2'";
 
 
     DBusError error;
