@@ -695,6 +695,8 @@ struct x11drv_win_data
     UINT        parent_invalid : 1; /* is the parent host window possibly invalid */
     UINT        reparenting : 1; /* window is being reparented, likely from a decoration change */
     UINT        is_resizable : 1; /* window is allowed to be resized by the window manager */
+    SIZE        min_track_size; /* minimum window size from WM_GETMINMAXINFO, in monitor DPI */
+    SIZE        max_track_size; /* maximum window size from WM_GETMINMAXINFO, in monitor DPI, 0 if unlimited */
     Window      embedder;       /* window id of embedder */
     Pixmap         icon_pixmap;
     Pixmap         icon_mask;

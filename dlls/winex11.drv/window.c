@@ -947,6 +947,31 @@ static void set_size_hints( struct x11drv_win_data *data, DWORD style )
             size_hints->min_height = size_hints->max_height;
             size_hints->flags |= PMinSize | PMaxSize;
         }
+        else if (data->min_track_size.cx > 0 || data->max_track_size.cx > 0 || data->max_track_size.cy > 0)
+        {
+            /* the limits are for the window rect, the X window is the visible rect; they never
+             * exclude the current size, so the window manager does not resize the window itself */
+            int width = data->rects.visible.right - data->rects.visible.left;
+            int height = data->rects.visible.bottom - data->rects.visible.top;
+            int dx = (data->rects.window.right - data->rects.window.left) - width;
+            int dy = (data->rects.window.bottom - data->rects.window.top) - height;
+
+            if (width > 0 && height > 0)
+            {
+                if (data->min_track_size.cx > 0)
+                {
+                    size_hints->min_width = max( 1, min( data->min_track_size.cx - dx, width ));
+                    size_hints->min_height = max( 1, min( data->min_track_size.cy - dy, height ));
+                    size_hints->flags |= PMinSize;
+                }
+                if (data->max_track_size.cx > 0 || data->max_track_size.cy > 0)
+                {
+                    size_hints->max_width = data->max_track_size.cx > 0 ? max( data->max_track_size.cx - dx, width ) : 0x7fff;
+                    size_hints->max_height = data->max_track_size.cy > 0 ? max( data->max_track_size.cy - dy, height ) : 0x7fff;
+                    size_hints->flags |= PMaxSize;
+                }
+            }
+        }
     }
 
     window_set_wm_normal_hints( data, size_hints );
@@ -3272,6 +3297,86 @@ static BOOL get_desired_wm_state( DWORD style, const struct window_rects *rects 
 }
 
 
+static int scale_dpi( int value, UINT to, UINT from )
+{
+    return ((INT64)value * to + from / 2) / from;
+}
+
+/***********************************************************************
+ *              get_track_size_limits
+ *
+ * Ask the window for its minimum and maximum tracking size with WM_GETMINMAXINFO, with the
+ * same defaults as win32u, and convert them to monitor DPI. Sends a message, so it must not be
+ * called with the window data locked.
+ */
+static void get_track_size_limits( HWND hwnd, DWORD style, DWORD ex_style, SIZE *min_size, SIZE *max_size )
+{
+    UINT context, dpi, raw_dpi;
+    DWORD adjusted_style;
+    MINMAXINFO minmax;
+    INT default_max_x, default_max_y, xinc, yinc;
+    RECT rc;
+
+    min_size->cx = min_size->cy = max_size->cx = max_size->cy = 0;
+
+    context = NtUserSetThreadDpiAwarenessContext( NtUserGetWindowDpiAwarenessContext( hwnd ));
+    dpi = NtUserGetDpiForWindow( hwnd );
+
+    NtUserGetWindowRect( hwnd, &rc, dpi );
+    minmax.ptReserved.x = rc.left;
+    minmax.ptReserved.y = rc.top;
+
+    if ((style & WS_CAPTION) == WS_CAPTION) adjusted_style = style & ~WS_BORDER;
+    else adjusted_style = style;
+
+    SetRect( &rc, 0, 0, NtUserGetSystemMetrics( SM_CXSCREEN ), NtUserGetSystemMetrics( SM_CYSCREEN ));
+    NtUserAdjustWindowRect( &rc, adjusted_style, (style & WS_POPUP) && NtUserGetWindowLongPtrW( hwnd, GWLP_ID ),
+                            ex_style, dpi );
+    xinc = -rc.left;
+    yinc = -rc.top;
+
+    minmax.ptMaxSize.x = rc.right - rc.left;
+    minmax.ptMaxSize.y = rc.bottom - rc.top;
+    if ((style & (WS_DLGFRAME | WS_BORDER)) && !(ex_style & WS_EX_TOOLWINDOW))
+    {
+        minmax.ptMinTrackSize.x = NtUserGetSystemMetrics( SM_CXMINTRACK );
+        minmax.ptMinTrackSize.y = NtUserGetSystemMetrics( SM_CYMINTRACK );
+    }
+    else
+    {
+        minmax.ptMinTrackSize.x = 2 * xinc;
+        minmax.ptMinTrackSize.y = 2 * yinc;
+    }
+    default_max_x = minmax.ptMaxTrackSize.x = NtUserGetSystemMetrics( SM_CXMAXTRACK );
+    default_max_y = minmax.ptMaxTrackSize.y = NtUserGetSystemMetrics( SM_CYMAXTRACK );
+    minmax.ptMaxPosition.x = -xinc;
+    minmax.ptMaxPosition.y = -yinc;
+
+    send_message( hwnd, WM_GETMINMAXINFO, 0, (LPARAM)&minmax );
+
+    NtUserSetThreadDpiAwarenessContext( context );
+
+    raw_dpi = NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI );
+    if (!dpi || !raw_dpi) dpi = raw_dpi = 96;
+
+    if (minmax.ptMinTrackSize.x > 0 && minmax.ptMinTrackSize.y > 0)
+    {
+        min_size->cx = scale_dpi( minmax.ptMinTrackSize.x, raw_dpi, dpi );
+        min_size->cy = scale_dpi( minmax.ptMinTrackSize.y, raw_dpi, dpi );
+    }
+    /* only a limit the application set below the default, which covers the whole virtual screen */
+    if (minmax.ptMaxTrackSize.x > 0 && minmax.ptMaxTrackSize.x < default_max_x)
+        max_size->cx = scale_dpi( max( minmax.ptMaxTrackSize.x, minmax.ptMinTrackSize.x ), raw_dpi, dpi );
+    if (minmax.ptMaxTrackSize.y > 0 && minmax.ptMaxTrackSize.y < default_max_y)
+        max_size->cy = scale_dpi( max( minmax.ptMaxTrackSize.y, minmax.ptMinTrackSize.y ), raw_dpi, dpi );
+
+    TRACE( "win %p min track %d,%d max track %d,%d dpi %u raw %u -> min %d,%d max %d,%d\n", hwnd,
+           (int)minmax.ptMinTrackSize.x, (int)minmax.ptMinTrackSize.y, (int)minmax.ptMaxTrackSize.x,
+           (int)minmax.ptMaxTrackSize.y, dpi, raw_dpi, (int)min_size->cx, (int)min_size->cy,
+           (int)max_size->cx, (int)max_size->cy );
+}
+
+
 /***********************************************************************
  *		WindowPosChanged   (X11DRV.@)
  */
@@ -3282,11 +3387,23 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     UINT ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ), new_style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
     struct window_rects old_rects;
     BOOL is_managed, was_fullscreen, activate = !(swp_flags & SWP_NOACTIVATE), fullscreen = !!(swp_flags & WINE_SWP_FULLSCREEN);
+    SIZE min_track_size = {0}, max_track_size = {0};
+    BOOL track_limits;
 
     if ((is_managed = is_window_managed( hwnd, swp_flags, fullscreen ))) make_owner_managed( hwnd );
 
+    /* the window manager enforces the size limits of a window it lets the user resize */
+    if ((track_limits = (swp_flags & WINE_SWP_RESIZABLE) && !(new_style & (WS_MINIMIZE | WS_MAXIMIZE)) &&
+                        NtUserGetAncestor( hwnd, GA_PARENT ) == NtUserGetDesktopWindow()))
+        get_track_size_limits( hwnd, new_style, ex_style, &min_track_size, &max_track_size );
+
     if (!(data = get_win_data( hwnd ))) return;
     if (is_managed) window_set_managed( data, TRUE );
+    if (track_limits)
+    {
+        data->min_track_size = min_track_size;
+        data->max_track_size = max_track_size;
+    }
 
     old_rects = data->rects;
     was_fullscreen = data->is_fullscreen;
