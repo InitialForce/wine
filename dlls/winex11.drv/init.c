@@ -315,19 +315,19 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
     BOOL offscreen = needs_offscreen_rendering( hwnd, surface->client.raw );
     struct x11drv_win_data *data;
 
-    if (InterlockedExchange( &surface->client.offscreen, offscreen ) == offscreen)
+    /* A window has one onscreen client window. A window that spans monitors can have one client
+     * surface per monitor (WPF's D3D9 makes a swap chain per adapter). Take the onscreen slot
+     * under the window lock, so two surfaces cannot both take it, and composite a surface that
+     * finds it taken instead of swapping the X windows on every update. */
+    if (!offscreen && (data = get_win_data( hwnd )))
     {
-        if (!offscreen && (data = get_win_data( hwnd )))
-        {
-            attach_client_window( data, surface->window );
-            release_win_data( data );
-        }
-        return;
+        if (data->client_window && data->client_window != surface->window) offscreen = TRUE;
+        else attach_client_window( data, surface->window );
+        release_win_data( data );
     }
-    else
-    {
-        TRACE( "%s offscreen %u\n", debugstr_client_surface( &surface->client ), offscreen );
-    }
+
+    if (InterlockedExchange( &surface->client.offscreen, offscreen ) == offscreen) return;
+    TRACE( "%s offscreen %u\n", debugstr_client_surface( &surface->client ), offscreen );
 
     if (!offscreen)
     {
@@ -361,10 +361,9 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
 #endif
     }
 
-    if ((data = get_win_data( hwnd )))
+    if (offscreen && (data = get_win_data( hwnd )))
     {
-        if (offscreen) detach_client_window( data, surface->window );
-        else attach_client_window( data, surface->window );
+        detach_client_window( data, surface->window );
         release_win_data( data );
     }
 }
