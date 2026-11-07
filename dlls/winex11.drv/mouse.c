@@ -263,31 +263,44 @@ void x11drv_init_mouse( Display *display )
     free( InterlockedExchangePointer( (void**)&pointer_mapping, tmp ) );
 }
 
+/* The source device of an event can be gone by the time we query it, and the
+ * server then answers an XInput request with BadDevice. */
+static int device_mapping_error( Display *display, XErrorEvent *event, void *arg )
+{
+    return event->request_code == xinput2_opcode;
+}
+
 static void update_device_mapping( Display *display, int deviceid )
 {
     struct mouse_button_mapping *tmp;
     XDevice *device;
 
-    if (!deviceid || !(device = pXOpenDevice( display, deviceid )))
-    {
-        WARN( "Unable to open cursor device %d\n", deviceid );
-        return;
-    }
+    if (!deviceid) return;
 
     if (!(tmp = malloc( sizeof(*tmp) )))
     {
         WARN( "Unable to allocate device mapping.\n" );
-        pXCloseDevice( display, device );
         return;
     }
 
     tmp->deviceid = deviceid;
     tmp->button_count = ARRAY_SIZE( tmp->buttons );
-    tmp->button_count = pXGetDeviceButtonMapping( display, device, tmp->buttons, tmp->button_count );
+
+    X11DRV_expect_error( display, device_mapping_error, NULL );
+    if ((device = pXOpenDevice( display, deviceid )))
+    {
+        tmp->button_count = pXGetDeviceButtonMapping( display, device, tmp->buttons, tmp->button_count );
+        pXCloseDevice( display, device );
+    }
+    XSync( display, False );
+    if (X11DRV_check_error() || !device)
+    {
+        WARN( "Unable to read the button mapping of cursor device %d, keeping the current one\n", deviceid );
+        free( tmp );
+        return;
+    }
 
     free( InterlockedExchangePointer( (void**)&device_mapping, tmp ) );
-
-    pXCloseDevice( display, device );
 }
 
 /***********************************************************************
