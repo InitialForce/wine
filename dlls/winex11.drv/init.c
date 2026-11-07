@@ -220,10 +220,26 @@ static BOOL needs_client_window_clipping( HWND hwnd )
     return ret > 0;
 }
 
-static BOOL needs_offscreen_rendering( HWND hwnd, BOOL raw )
+/* A window has room for one onscreen client window. D3D9 creates one swap chain per monitor for a
+ * window that spans monitors, and each further client surface of the window is composited. */
+static BOOL has_other_client_window( HWND hwnd, Window client_window )
+{
+    struct x11drv_win_data *data;
+    BOOL ret = FALSE;
+
+    if ((data = get_win_data( hwnd )))
+    {
+        ret = data->client_window && data->client_window != client_window;
+        release_win_data( data );
+    }
+    return ret;
+}
+
+static BOOL needs_offscreen_rendering( HWND hwnd, BOOL raw, Window client_window )
 {
     if (!raw && NtUserGetDpiForWindow( hwnd ) != NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI )) return TRUE; /* needs DPI scaling */
     if (NtUserGetAncestor( hwnd, GA_PARENT ) != NtUserGetDesktopWindow()) return TRUE; /* child window, needs compositing */
+    if (has_other_client_window( hwnd, client_window )) return TRUE; /* another surface is onscreen, needs compositing */
     if (NtUserGetWindowRelative( hwnd, GW_CHILD )) return needs_client_window_clipping( hwnd ); /* window has children, needs compositing */
     return FALSE;
 }
@@ -312,7 +328,7 @@ static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surf
 
 static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_surface *surface )
 {
-    BOOL offscreen = needs_offscreen_rendering( hwnd, surface->client.raw );
+    BOOL offscreen = needs_offscreen_rendering( hwnd, surface->client.raw, surface->window );
     struct x11drv_win_data *data;
 
     if (InterlockedExchange( &surface->client.offscreen, offscreen ) == offscreen)
