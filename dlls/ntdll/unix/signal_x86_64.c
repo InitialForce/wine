@@ -1660,6 +1660,28 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
 
 
 /***********************************************************************
+ *           special_apc_on_syscall_return
+ *
+ * Called by the syscall dispatcher when a signal came during the system call, which may be for a
+ * special user APC. Runs the APC as the call returns, as Windows does, unless the call changed
+ * the context the thread returns to; the wineserver then signals again.
+ */
+ULONG_PTR special_apc_on_syscall_return( ULONG_PTR ret )
+{
+    struct thread_data *data = get_thread_data();
+    struct syscall_frame *frame = get_syscall_frame( data );
+    struct user_apc apc;
+
+    get_teb_data( data )->syscall_trace &= ~SYSCALL_SIGNALLED;
+    if (frame->restore_flags & ~RESTORE_FLAGS_INSTRUMENTATION) return ret;
+    if (frame->cs != cs64_sel) return ret;
+    if (!get_special_user_apc( &apc )) return ret;
+    return call_user_apc_dispatcher( NULL, apc.flags, apc.args[0], apc.args[1], apc.args[2],
+                                     wine_server_get_ptr( apc.func ), ret );
+}
+
+
+/***********************************************************************
  *           setup_special_user_apc
  *
  * Run a special user APC on a thread that a signal interrupted in user code: the signal
@@ -2716,6 +2738,9 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         I386_CONTEXT *wow_context;
         struct xcontext *context;
 
+        /* the dispatcher checks for a special user APC when the system call returns */
+        get_teb_data( data )->syscall_trace |= SYSCALL_SIGNALLED;
+
         context = (struct xcontext *)(((ULONG_PTR)RSP_sig(sigcontext) - 128 /* red zone */ - sizeof(*context)) & ~15);
         if ((char *)context < (char *)get_kernel_stack( data ))
         {
@@ -3345,6 +3370,8 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "movq (%r15),%r8\n\t"           /* 5th argument */
                    "movq 8(%r15),%r9\n\t"          /* 6th argument */
                    "callq *%r12\n\t"
+                   "testl $2,0x380(%r13)\n\t"    /* thread_data->syscall_trace & SYSCALL_SIGNALLED */
+                   "jnz " __ASM_LOCAL_LABEL("special_apc_ret") "\n\t"
                    "leaq -0x98(%rbp),%rcx\n\t"
                    __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") ":\n\t"
                    /* push rbp-based kernel stack cfi */
@@ -3502,8 +3529,16 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "movl 0x18(%rbp),%edi\n\t"      /* frame->syscall_id */
                    "movq %r12,%rsi\n\t"            /* retval */
                    "call " __ASM_NAME("trace_sysret") "\n\t"
-                   "leaq -0x98(%rbp),%rcx\n\t"     /* syscall frame */
                    "movq %r12,%rax\n\t"
+                   "testl $2,0x380(%r13)\n\t"    /* thread_data->syscall_trace & SYSCALL_SIGNALLED */
+                   "jnz " __ASM_LOCAL_LABEL("special_apc_ret") "\n\t"
+                   "leaq -0x98(%rbp),%rcx\n\t"     /* syscall frame */
+                   "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") "\n"
+
+                   __ASM_LOCAL_LABEL("special_apc_ret") ":\n\t"
+                   "movq %rax,%rdi\n\t"          /* return value */
+                   "call " __ASM_NAME("special_apc_on_syscall_return") "\n\t"
+                   "leaq -0x98(%rbp),%rcx\n\t"     /* syscall frame */
                    "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") "\n"
 
                    __ASM_LOCAL_LABEL("bad_syscall") ":\n\t"

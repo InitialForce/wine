@@ -147,6 +147,9 @@ struct teb_data
     int                       syscall_trace; /* 21c/0380 syscall trace flag */
 };
 
+/* syscall_trace bit set by the SIGUSR1 handler when it interrupts a system call (x86_64) */
+#define SYSCALL_SIGNALLED 2
+
 C_ASSERT( sizeof(struct teb_data) <= sizeof(((TEB *)0)->GdiTebBatch) );
 #ifdef _WIN64
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct teb_data, syscall_table ) == 0x370 );
@@ -422,6 +425,7 @@ extern void dbg_init(void);
 
 extern void close_inproc_sync( HANDLE handle );
 
+extern ULONG_PTR special_apc_on_syscall_return( ULONG_PTR ret );
 extern NTSTATUS call_user_apc_dispatcher( CONTEXT *context_ptr, unsigned int flags, ULONG_PTR arg1, ULONG_PTR arg2,
                                           ULONG_PTR arg3, PNTAPCFUNC func, NTSTATUS status );
 extern NTSTATUS call_user_exception_dispatcher( struct thread_data *data, EXCEPTION_RECORD *rec,
