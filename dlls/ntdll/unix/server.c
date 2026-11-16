@@ -849,10 +849,13 @@ NTSTATUS WINAPI NtContinueEx( CONTEXT *context, KCONTINUE_ARGUMENT *args )
 {
     struct user_apc apc;
     NTSTATUS status;
-    BOOL alertable;
+    BOOL alertable, deliver_apc = FALSE;
 
     if ((UINT_PTR)args > 0xff)
+    {
         alertable = args->ContinueFlags & KCONTINUE_FLAG_TEST_ALERT;
+        deliver_apc = args->ContinueFlags & KCONTINUE_FLAG_DELIVER_APC;
+    }
     else
         alertable = !!args;
 
@@ -861,6 +864,8 @@ NTSTATUS WINAPI NtContinueEx( CONTEXT *context, KCONTINUE_ARGUMENT *args )
         status = server_select( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE, 0, NULL, &apc );
         if (status == STATUS_USER_APC) return invoke_user_apc( context, &apc, status );
     }
+    else if (deliver_apc && get_special_user_apc( &apc ))
+        return invoke_user_apc( context, &apc, STATUS_USER_APC );
     return signal_set_full_context( context );
 }
 

@@ -35,6 +35,10 @@
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <dlfcn.h>
+#ifdef __linux__
+#include <link.h>
+#endif
 #ifdef HAVE_LINK_H
 # include <link.h>
 #endif
@@ -536,6 +540,41 @@ static unsigned int frame_size;
 static unsigned int xstate_size = sizeof(XSAVE_AREA_HEADER);
 static UINT64 xstate_extended_features;
 static LONG syscall_dispatch_enabled = TRUE;
+
+/* executable range of ntdll.so; its syscall dispatchers run on the user stack */
+static ULONG_PTR unix_code_start, unix_code_end;
+
+static void init_unix_code_range(void)
+{
+#ifdef __linux__
+    Dl_info info;
+    const ElfW(Ehdr) *ehdr;
+    const ElfW(Phdr) *phdr;
+    ULONG_PTR base;
+    int i;
+
+    if (!dladdr( (void *)init_unix_code_range, &info ) || !info.dli_fbase) return;
+    ehdr = info.dli_fbase;
+    base = (ULONG_PTR)info.dli_fbase;
+    phdr = (const ElfW(Phdr) *)((const char *)ehdr + ehdr->e_phoff);
+    /* the first PT_LOAD of a shared object is mapped at dli_fbase */
+    for (i = 0; i < ehdr->e_phnum; i++)
+    {
+        if (phdr[i].p_type != PT_LOAD) continue;
+        base -= phdr[i].p_vaddr & ~(ElfW(Addr))(page_size - 1);
+        break;
+    }
+    for (i = 0; i < ehdr->e_phnum; i++)
+    {
+        ULONG_PTR start, end;
+        if (phdr[i].p_type != PT_LOAD || !(phdr[i].p_flags & PF_X)) continue;
+        start = base + phdr[i].p_vaddr;
+        end = start + phdr[i].p_memsz;
+        if (!unix_code_start || start < unix_code_start) unix_code_start = start;
+        if (end > unix_code_end) unix_code_end = end;
+    }
+#endif
+}
 
 static inline struct thread_data *get_current_thread_data(void)
 {
@@ -1537,15 +1576,39 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
     struct thread_data *data = get_thread_data();
     struct syscall_frame *frame = get_syscall_frame( data );
     ULONG64 rsp = context ? context->Rsp : frame->rsp;
+    XSAVE_AREA_HEADER *src_xs = NULL;
     struct apc_stack_layout *stack;
 
-    if (flags & ~SERVER_USER_APC_CALLBACK_DATA_CONTEXT) FIXME( "flags %#x are not supported.\n", flags );
+    if (flags & ~(SERVER_USER_APC_CALLBACK_DATA_CONTEXT | SERVER_USER_APC_SPECIAL))
+        FIXME( "flags %#x are not supported.\n", flags );
 
+    if (context)
+    {
+        /* a special APC delivered by NtContinueEx gets the frame of the APC before it, which lies
+         * below that context's Rsp; build the new frame below it, so the copy cannot overlap */
+        if ((ULONG64)context < rsp) rsp = (ULONG64)context;
+        if ((context->ContextFlags & CONTEXT_XSTATE) == CONTEXT_XSTATE)
+        {
+            const CONTEXT_EX *xctx = (const CONTEXT_EX *)(context + 1);
+            if (xctx->XState.Offset > 0 && xctx->XState.Length >= sizeof(XSAVE_AREA_HEADER))
+                src_xs = xstate_from_context( context );
+        }
+    }
     rsp &= ~15;
+    if (src_xs) rsp = (rsp - xstate_size) & ~(ULONG64)63;
     stack = (struct apc_stack_layout *)rsp - 1;
     if (context)
     {
         memmove( &stack->context, context, sizeof(stack->context) );
+        if (src_xs)
+        {
+            XSAVE_AREA_HEADER *dst_xs = (XSAVE_AREA_HEADER *)rsp;
+            context_init_xstate( &stack->context, dst_xs );
+            memset( dst_xs, 0, sizeof(*dst_xs) );
+            dst_xs->CompactionMask = user_shared_data->XState.CompactionEnabled ? 0x8000000000000000 | xstate_extended_features : 0;
+            copy_xstate( dst_xs, src_xs, src_xs->Mask );
+        }
+        else stack->context.ContextFlags &= ~(CONTEXT_XSTATE & ~CONTEXT_AMD64);
         NtSetContextThread( GetCurrentThread(), &stack->context );
     }
     else
@@ -1556,7 +1619,8 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
     }
     memset( &stack->continue_arg, 0, sizeof(stack->continue_arg) );
     stack->continue_arg.ContinueType = KCONTINUE_RESUME;
-    stack->continue_arg.ContinueFlags = KCONTINUE_FLAG_TEST_ALERT | KCONTINUE_FLAG_DELIVER_APC;
+    stack->continue_arg.ContinueFlags = KCONTINUE_FLAG_DELIVER_APC;
+    if (!(flags & SERVER_USER_APC_SPECIAL)) stack->continue_arg.ContinueFlags |= KCONTINUE_FLAG_TEST_ALERT;
     stack->context.P1Home    = arg1;
     if (flags & SERVER_USER_APC_CALLBACK_DATA_CONTEXT)
     {
@@ -1576,6 +1640,83 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
     frame->rip = (ULONG64)pKiUserApcDispatcher;
     frame->restore_flags |= CONTEXT_CONTROL;
     return status;
+}
+
+
+/***********************************************************************
+ *           setup_special_user_apc
+ *
+ * Run a special user APC on a thread that a signal interrupted in user code: the signal
+ * handler returns into KiUserApcDispatcher, and NtContinueEx then resumes the interrupted
+ * context. Returns FALSE when no special APC is queued or the stack has no room for the frame.
+ */
+static BOOL setup_special_user_apc( struct thread_data *data, ucontext_t *sigcontext,
+                                    struct xcontext *xcontext )
+{
+    CONTEXT *context = &xcontext->c;
+    XSAVE_AREA_HEADER *src_xs = xstate_from_context( context );
+    struct apc_stack_layout *stack;
+    struct user_apc apc;
+    EXCEPTION_RECORD rec = { 0 };
+    ULONG_PTR rsp, frame;
+    void *callback;
+
+    if (context->SegCs != cs64_sel) return FALSE;
+    /* the syscall dispatchers save and restore the syscall frame while on the user stack;
+     * leave the APC queued, and the wineserver signals again */
+    if (!unix_code_end || (context->Rip >= unix_code_start && context->Rip < unix_code_end)) return FALSE;
+    if (!get_special_user_apc( &apc )) return FALSE;
+
+    rsp = context->Rsp & ~(ULONG_PTR)15;
+    frame = src_xs ? ((rsp - xstate_size) & ~(ULONG_PTR)63) : rsp;
+    /* commits the stack pages the frame needs, as for an exception */
+    rec.ExceptionAddress = (void *)context->Rip;
+    stack = virtual_setup_exception( data, (void *)rsp, rsp - (frame - sizeof(*stack)), &rec );
+
+    stack->context = *context;
+    stack->context.ContextFlags = (context->ContextFlags | CONTEXT_FULL) &
+        ~(CONTEXT_XSTATE | CONTEXT_EXCEPTION_REPORTING | CONTEXT_EXCEPTION_ACTIVE | CONTEXT_SERVICE_ACTIVE);
+    if (src_xs)
+    {
+        XSAVE_AREA_HEADER *dst_xs = (XSAVE_AREA_HEADER *)frame;
+        context_init_xstate( &stack->context, dst_xs );
+        memset( dst_xs, 0, sizeof(*dst_xs) );
+        dst_xs->CompactionMask = user_shared_data->XState.CompactionEnabled ? 0x8000000000000000 | xstate_extended_features : 0;
+        copy_xstate( dst_xs, src_xs, src_xs->Mask );
+    }
+    else context_init_xstate( &stack->context, NULL );
+
+    memset( &stack->continue_arg, 0, sizeof(stack->continue_arg) );
+    stack->continue_arg.ContinueType = KCONTINUE_RESUME;
+    /* NtContinueEx runs the next special APC, if one was queued while this one waited */
+    stack->continue_arg.ContinueFlags = KCONTINUE_FLAG_DELIVER_APC;
+    stack->context.P1Home = apc.args[0];
+    if (apc.flags & SERVER_USER_APC_CALLBACK_DATA_CONTEXT)
+    {
+        stack->callback_data.ContextRecord = &stack->context;
+        stack->callback_data.Parameter = apc.args[1];
+        stack->callback_data.Reserved0 = 0;
+        stack->callback_data.Reserved1 = 0;
+        stack->context.P2Home = (ULONG_PTR)&stack->callback_data;
+    }
+    else stack->context.P2Home = apc.args[1];
+    stack->context.P3Home = apc.args[2];
+    stack->context.P4Home = (ULONG64)wine_server_get_ptr( apc.func );
+    stack->machine_frame.rip = context->Rip;
+    stack->machine_frame.rsp = context->Rsp;
+
+    CS_sig(sigcontext)  = cs64_sel;
+    RIP_sig(sigcontext) = (ULONG_PTR)pKiUserApcDispatcher;
+    RSP_sig(sigcontext) = (ULONG_PTR)stack;
+    /* clear single-step, direction, and align check flag */
+    EFL_sig(sigcontext) &= ~(0x100|0x400|0x40000);
+    if ((callback = instrumentation_callback))
+    {
+        R10_sig(sigcontext) = RIP_sig(sigcontext);
+        RIP_sig(sigcontext) = (ULONG64)callback;
+    }
+    leave_handler( data, sigcontext );
+    return TRUE;
 }
 
 
@@ -2605,7 +2746,8 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         context.c.ContextFlags |= CONTEXT_EXCEPTION_REPORTING;
         if (is_wow64() && context.c.SegCs == cs64_sel) context.c.ContextFlags |= CONTEXT_EXCEPTION_ACTIVE;
         wait_suspend( &context.c );
-        restore_context( data, &context, sigcontext );
+        if (!setup_special_user_apc( data, sigcontext, &context ))
+            restore_context( data, &context, sigcontext );
     }
 }
 
@@ -2807,6 +2949,7 @@ void signal_init_process( TEB *teb )
 
     if (user_shared_data->XState.Size) xstate_size = user_shared_data->XState.Size - sizeof(XSAVE_FORMAT);
     frame_size = offsetof( struct syscall_frame, xstate ) + xstate_size;
+    init_unix_code_range();
     xstate_extended_features = user_shared_data->XState.EnabledFeatures & ~(UINT64)3;
 
     /* sneak in a syscall dispatcher pointer at a fixed address (7ffe1000) */

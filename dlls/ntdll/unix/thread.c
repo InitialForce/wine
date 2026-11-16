@@ -1563,6 +1563,21 @@ void wait_suspend( CONTEXT *context )
 }
 
 
+/**********************************************************************
+ *           get_special_user_apc
+ *
+ * Take the first special user APC queued for the current thread, without waiting.
+ * Called from a signal handler, so that the APC can run when the signal interrupted user code.
+ */
+BOOL get_special_user_apc( struct user_apc *apc )
+{
+    int saved_errno = errno;
+    unsigned int ret = server_select( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_SPECIAL_APC, 0, NULL, apc );
+    errno = saved_errno;
+    return ret == STATUS_USER_APC;
+}
+
+
 #ifdef __APPLE__
 /**********************************************************************
  *           apple_spawn_main_thread

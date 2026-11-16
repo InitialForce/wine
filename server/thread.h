@@ -95,6 +95,8 @@ struct thread
     int                    desktop_users; /* number of objects using the thread desktop */
     timeout_t              creation_time; /* Thread creation time */
     timeout_t              exit_time;     /* Thread exit time */
+    struct timeout_user   *special_apc_retry; /* timer that signals again for a special user APC */
+    timeout_t              special_apc_delay; /* delay before the next retry */
     struct token          *token;         /* security token associated with this thread */
     struct list            kernel_object; /* list of kernel object pointers */
     data_size_t            desc_len;      /* thread description length in bytes */
