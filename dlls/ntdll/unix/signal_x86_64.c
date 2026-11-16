@@ -1576,6 +1576,8 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
     struct thread_data *data = get_thread_data();
     struct syscall_frame *frame = get_syscall_frame( data );
     ULONG64 rsp = context ? context->Rsp : frame->rsp;
+    /* the largest state Wine enables (AVX-512) takes under 0xa00 bytes after the legacy area */
+    char xs_buf[0x1000] DECLSPEC_ALIGN(64);
     XSAVE_AREA_HEADER *saved_xs = NULL;
     struct apc_stack_layout *stack;
     CONTEXT saved;
@@ -1592,9 +1594,20 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
         if ((context->ContextFlags & CONTEXT_XSTATE) == CONTEXT_XSTATE)
         {
             const CONTEXT_EX *xctx = (const CONTEXT_EX *)(context + 1);
-            if (xctx->XState.Offset > 0 && xctx->XState.Length >= sizeof(XSAVE_AREA_HEADER) &&
-                (saved_xs = malloc( xstate_size )))
-                memcpy( saved_xs, xstate_from_context( context ), min( xctx->XState.Length, xstate_size ));
+            if (xctx->XState.Offset > 0 && xctx->XState.Length >= sizeof(XSAVE_AREA_HEADER))
+            {
+                if (xstate_size <= sizeof(xs_buf))
+                {
+                    saved_xs = (XSAVE_AREA_HEADER *)xs_buf;
+                    memcpy( saved_xs, xstate_from_context( context ), min( xctx->XState.Length, xstate_size ));
+                }
+                else
+                {
+                    /* no room to copy it: build the frame below the source instead of over it */
+                    saved_xs = xstate_from_context( context );
+                    rsp = min( rsp, (ULONG64)context );
+                }
+            }
         }
     }
     rsp &= ~15;
@@ -1610,7 +1623,6 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
             memset( dst_xs, 0, sizeof(*dst_xs) );
             dst_xs->CompactionMask = user_shared_data->XState.CompactionEnabled ? 0x8000000000000000 | xstate_extended_features : 0;
             copy_xstate( dst_xs, saved_xs, saved_xs->Mask );
-            free( saved_xs );
         }
         else stack->context.ContextFlags &= ~(CONTEXT_XSTATE & ~CONTEXT_AMD64);
         NtSetContextThread( GetCurrentThread(), &stack->context );
