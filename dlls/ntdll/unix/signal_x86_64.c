@@ -1596,17 +1596,15 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
             const CONTEXT_EX *xctx = (const CONTEXT_EX *)(context + 1);
             if (xctx->XState.Offset > 0 && xctx->XState.Length >= sizeof(XSAVE_AREA_HEADER))
             {
+                unsigned int len = min( xctx->XState.Length, xstate_size );
+
                 if (xstate_size <= sizeof(xs_buf))
                 {
                     saved_xs = (XSAVE_AREA_HEADER *)xs_buf;
-                    memcpy( saved_xs, xstate_from_context( context ), min( xctx->XState.Length, xstate_size ));
+                    memcpy( saved_xs, xstate_from_context( context ), len );
+                    memset( xs_buf + len, 0, xstate_size - len );
                 }
-                else
-                {
-                    /* no room to copy it: build the frame below the source instead of over it */
-                    saved_xs = xstate_from_context( context );
-                    rsp = min( rsp, (ULONG64)context );
-                }
+                else ERR_(seh)( "extended state size %#x is too large, dropping it.\n", xstate_size );
             }
         }
     }
@@ -1673,10 +1671,18 @@ ULONG_PTR special_apc_on_syscall_return( ULONG_PTR ret )
     struct xcontext context;
     struct user_apc apc;
 
-    get_teb_data( data )->syscall_trace &= ~SYSCALL_SIGNALLED;
-    if (frame->restore_flags & RESTORE_FLAGS_INCOMPLETE_FRAME_CONTEXT) return ret;
-    if (frame->cs != cs64_sel) return ret;
-    if (!get_special_user_apc( &apc )) return ret;
+    /* A signal that comes after the bit is cleared sets it again; ask the server again then,
+     * since the APC may have been queued after its last answer. A signal that comes after the
+     * dispatcher's last test of the bit is not seen here; the wineserver signals again until
+     * the thread takes the APC. Returning early leaves the APC queued for that same reason. */
+    for (;;)
+    {
+        get_teb_data( data )->syscall_trace &= ~SYSCALL_SIGNALLED;
+        if (frame->restore_flags & RESTORE_FLAGS_INCOMPLETE_FRAME_CONTEXT) return ret;
+        if (frame->cs != cs64_sel) return ret;
+        if (get_special_user_apc( &apc )) break;
+        if (!(get_teb_data( data )->syscall_trace & SYSCALL_SIGNALLED)) return ret;
+    }
 
     context.c.ContextFlags = CONTEXT_FULL | CONTEXT_SEGMENTS;
     NtGetContextThread( GetCurrentThread(), &context.c );
@@ -3563,6 +3569,8 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_return,
                    "leaq 0x98(%rcx),%rbp\n\t"
                    "testl $1,0x380(%r13)\n\t"      /* thread_data->syscall_trace */
                    "jnz " __ASM_LOCAL_LABEL("trace_syscall_ret" ) "\n\t"
+                   "testl $2,0x380(%r13)\n\t"      /* thread_data->syscall_trace & SYSCALL_SIGNALLED */
+                   "jnz " __ASM_LOCAL_LABEL("special_apc_ret") "\n\t"
                    "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") )
 
 __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_instrumentation,
