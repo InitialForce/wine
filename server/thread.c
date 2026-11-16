@@ -386,6 +386,8 @@ static inline void init_thread_structure( struct thread *thread )
     list_init( &thread->d3dkmt_mutexes );
     list_init( &thread->system_apc );
     list_init( &thread->user_apc );
+    thread->special_apc_retry = NULL;
+    thread->special_apc_delay = 0;
     list_init( &thread->kernel_object );
 
     for (i = 0; i < MAX_INFLIGHT_FDS; i++)
@@ -568,6 +570,8 @@ static void cleanup_thread( struct thread *thread )
         release_object( thread->context );
         thread->context = NULL;
     }
+    if (thread->special_apc_retry) remove_timeout_user( thread->special_apc_retry );
+    thread->special_apc_retry = NULL;
     clear_apc_queue( &thread->system_apc );
     clear_apc_queue( &thread->user_apc );
     free( thread->req_data );
@@ -1394,6 +1398,33 @@ static inline int is_in_apc_wait( struct thread *thread )
     return (is_thread_suspended( thread ) || (thread->wait && (thread->wait->flags & SELECT_INTERRUPTIBLE)));
 }
 
+/* signal a thread for its special user APC until it takes it: the signal may have found
+ * the thread in a system call or in unix code, where the APC cannot run yet */
+static void special_apc_retry( void *private )
+{
+    struct thread *thread = private;
+
+    thread->special_apc_retry = NULL;
+    if (thread->state == TERMINATED || !has_special_user_apc( thread ))
+    {
+        thread->special_apc_delay = 0;
+        return;
+    }
+    if (!(thread->wait && (thread->wait->flags & SELECT_ALERTABLE)))
+        send_thread_signal( thread, SIGUSR1 );
+    thread->special_apc_delay = min( thread->special_apc_delay * 2, 100 * TICKS_PER_SEC / 1000 );
+    thread->special_apc_retry = add_timeout_user( -thread->special_apc_delay, special_apc_retry, thread );
+}
+
+static void signal_special_apc( struct thread *thread )
+{
+    if (!(thread->wait && (thread->wait->flags & SELECT_ALERTABLE)))
+        send_thread_signal( thread, SIGUSR1 );
+    if (thread->special_apc_retry) return;
+    thread->special_apc_delay = TICKS_PER_SEC / 1000;
+    thread->special_apc_retry = add_timeout_user( -thread->special_apc_delay, special_apc_retry, thread );
+}
+
 /* queue an existing APC to a given thread */
 static int queue_apc( struct process *process, struct thread *thread, struct thread_apc *apc )
 {
@@ -1441,8 +1472,7 @@ static int queue_apc( struct process *process, struct thread *thread, struct thr
             if (!send_thread_signal( thread, SIGUSR1 )) return 0;
         }
         /* interrupt a thread that runs code for a special user APC, as for a system APC */
-        if (is_special_user_apc( apc ) && !(thread->wait && (thread->wait->flags & SELECT_ALERTABLE)))
-            send_thread_signal( thread, SIGUSR1 );
+        if (is_special_user_apc( apc )) signal_special_apc( thread );
         /* cancel a possible previous APC with the same owner */
         if (apc->owner) thread_cancel_apc( thread, apc->owner, apc->call.type );
     }

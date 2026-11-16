@@ -7185,6 +7185,6 @@ union generic_reply
     struct alpc_create_port_reply alpc_create_port_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 962
+#define SERVER_PROTOCOL_VERSION 963
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
