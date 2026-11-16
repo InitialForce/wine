@@ -1576,16 +1576,39 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
     struct thread_data *data = get_thread_data();
     struct syscall_frame *frame = get_syscall_frame( data );
     ULONG64 rsp = context ? context->Rsp : frame->rsp;
+    XSAVE_AREA_HEADER *src_xs = NULL;
     struct apc_stack_layout *stack;
 
     if (flags & ~(SERVER_USER_APC_CALLBACK_DATA_CONTEXT | SERVER_USER_APC_SPECIAL))
         FIXME( "flags %#x are not supported.\n", flags );
 
+    if (context)
+    {
+        /* a special APC delivered by NtContinueEx gets the frame of the APC before it, which lies
+         * below that context's Rsp; build the new frame below it, so the copy cannot overlap */
+        if ((ULONG64)context < rsp) rsp = (ULONG64)context;
+        if ((context->ContextFlags & CONTEXT_XSTATE) == CONTEXT_XSTATE)
+        {
+            const CONTEXT_EX *xctx = (const CONTEXT_EX *)(context + 1);
+            if (xctx->XState.Offset > 0 && xctx->XState.Length >= sizeof(XSAVE_AREA_HEADER))
+                src_xs = xstate_from_context( context );
+        }
+    }
     rsp &= ~15;
+    if (src_xs) rsp = (rsp - xstate_size) & ~(ULONG64)63;
     stack = (struct apc_stack_layout *)rsp - 1;
     if (context)
     {
         memmove( &stack->context, context, sizeof(stack->context) );
+        if (src_xs)
+        {
+            XSAVE_AREA_HEADER *dst_xs = (XSAVE_AREA_HEADER *)rsp;
+            context_init_xstate( &stack->context, dst_xs );
+            memset( dst_xs, 0, sizeof(*dst_xs) );
+            dst_xs->CompactionMask = user_shared_data->XState.CompactionEnabled ? 0x8000000000000000 | xstate_extended_features : 0;
+            copy_xstate( dst_xs, src_xs, src_xs->Mask );
+        }
+        else stack->context.ContextFlags &= ~(CONTEXT_XSTATE & ~CONTEXT_AMD64);
         NtSetContextThread( GetCurrentThread(), &stack->context );
     }
     else
