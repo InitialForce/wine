@@ -1557,7 +1557,8 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
     }
     memset( &stack->continue_arg, 0, sizeof(stack->continue_arg) );
     stack->continue_arg.ContinueType = KCONTINUE_RESUME;
-    stack->continue_arg.ContinueFlags = KCONTINUE_FLAG_TEST_ALERT | KCONTINUE_FLAG_DELIVER_APC;
+    stack->continue_arg.ContinueFlags = KCONTINUE_FLAG_DELIVER_APC;
+    if (!(flags & SERVER_USER_APC_SPECIAL)) stack->continue_arg.ContinueFlags |= KCONTINUE_FLAG_TEST_ALERT;
     stack->context.P1Home    = arg1;
     if (flags & SERVER_USER_APC_CALLBACK_DATA_CONTEXT)
     {
@@ -1594,22 +1595,22 @@ static BOOL setup_special_user_apc( struct thread_data *data, ucontext_t *sigcon
     XSAVE_AREA_HEADER *src_xs = xstate_from_context( context );
     struct apc_stack_layout *stack;
     struct user_apc apc;
+    EXCEPTION_RECORD rec = { 0 };
     ULONG_PTR rsp, frame;
     void *callback;
 
     if (context->SegCs != cs64_sel) return FALSE;
+    if (!get_special_user_apc( &apc )) return FALSE;
 
     rsp = context->Rsp & ~(ULONG_PTR)15;
     frame = src_xs ? ((rsp - xstate_size) & ~(ULONG_PTR)63) : rsp;
-    stack = (struct apc_stack_layout *)frame - 1;
-    if ((char *)stack < (char *)data->teb->Tib.StackLimit + 2 * get_host_page_size() ||
-        rsp > (ULONG_PTR)data->teb->Tib.StackBase)
-        return FALSE;
-
-    if (!get_special_user_apc( &apc )) return FALSE;
+    /* commits the stack pages the frame needs, as for an exception */
+    rec.ExceptionAddress = (void *)context->Rip;
+    stack = virtual_setup_exception( data, (void *)rsp, rsp - (frame - sizeof(*stack)), &rec );
 
     stack->context = *context;
-    stack->context.ContextFlags = CONTEXT_FULL;
+    stack->context.ContextFlags = (context->ContextFlags | CONTEXT_FULL) &
+        ~(CONTEXT_XSTATE | CONTEXT_EXCEPTION_REPORTING | CONTEXT_EXCEPTION_ACTIVE | CONTEXT_SERVICE_ACTIVE);
     if (src_xs)
     {
         XSAVE_AREA_HEADER *dst_xs = (XSAVE_AREA_HEADER *)frame;
@@ -1622,6 +1623,8 @@ static BOOL setup_special_user_apc( struct thread_data *data, ucontext_t *sigcon
 
     memset( &stack->continue_arg, 0, sizeof(stack->continue_arg) );
     stack->continue_arg.ContinueType = KCONTINUE_RESUME;
+    /* NtContinueEx runs the next special APC, if one was queued while this one waited */
+    stack->continue_arg.ContinueFlags = KCONTINUE_FLAG_DELIVER_APC;
     stack->context.P1Home = apc.args[0];
     if (apc.flags & SERVER_USER_APC_CALLBACK_DATA_CONTEXT)
     {
