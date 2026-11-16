@@ -312,7 +312,10 @@ static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surf
 
 static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_surface *surface )
 {
-    BOOL offscreen = needs_offscreen_rendering( hwnd, surface->client.raw );
+    /* A window has one onscreen client window. When more than one surface draws into the window,
+     * as when WPF's D3D9 makes one swap chain per monitor, composite all of them: each present
+     * is clipped to its own monitor, and no client window is swapped in and out. */
+    BOOL offscreen = surface->client.shared || needs_offscreen_rendering( hwnd, surface->client.raw );
     struct x11drv_win_data *data;
 
     if (InterlockedExchange( &surface->client.offscreen, offscreen ) == offscreen)

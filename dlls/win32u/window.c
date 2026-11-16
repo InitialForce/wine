@@ -295,14 +295,20 @@ static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct list client_surfaces = LIST_INIT( client_surfaces ); /* non-owning used client surfaces */
 static struct list unused_surfaces = LIST_INIT( unused_surfaces ); /* owning unused client surfaces */
 
+static void update_sibling_surfaces_locked( HWND hwnd, struct client_surface *changed );
+
 static void client_surface_detach_locked( struct client_surface *surface )
 {
-    if (!surface->hwnd) return;
+    HWND hwnd = surface->hwnd;
+
+    if (!hwnd) return;
 
     list_remove( &surface->entry );
+    list_init( &surface->entry );
     surface->funcs->detach( surface );
     surface->toplevel = NULL;
     surface->hwnd = NULL;
+    update_sibling_surfaces_locked( hwnd, surface );
 }
 
 static void client_surface_release_locked( struct client_surface *surface )
@@ -357,11 +363,42 @@ static RECT get_client_surface_rects( HWND toplevel, HWND hwnd, RECT *monitor_re
     return rect;
 }
 
+/* whether another used surface draws into the same window, as when D3D9 makes one swap chain
+ * per monitor for a window that spans monitors */
+static BOOL is_client_surface_shared_locked( const struct client_surface *surface )
+{
+    const struct client_surface *other;
+    BOOL used = FALSE;
+    UINT count = 0;
+
+    if (!surface->hwnd) return FALSE;
+    LIST_FOR_EACH_ENTRY( other, &client_surfaces, struct client_surface, entry )
+    {
+        if (other->hwnd != surface->hwnd) continue;
+        if (other == surface) used = TRUE;
+        count++;
+    }
+    return used && count > 1;
+}
+
+static void client_surface_update_locked( struct client_surface *surface );
+
+/* update the other used surfaces of a window after a surface joined or left it */
+static void update_sibling_surfaces_locked( HWND hwnd, struct client_surface *changed )
+{
+    struct client_surface *surface, *next;
+
+    if (!hwnd) return;
+    LIST_FOR_EACH_ENTRY_SAFE( surface, next, &client_surfaces, struct client_surface, entry )
+        if (surface != changed && surface->hwnd == hwnd) client_surface_update_locked( surface );
+}
+
 static void client_surface_update_locked( struct client_surface *surface )
 {
     RECT virtual_rect = surface->virtual_rect, monitor_rect = surface->monitor_rect;
     HWND toplevel = surface->toplevel;
 
+    surface->shared = is_client_surface_shared_locked( surface );
     surface->toplevel = NtUserGetAncestor( surface->hwnd, GA_ROOT );
     surface->virtual_rect = get_client_surface_rects( surface->toplevel, surface->hwnd, &surface->monitor_rect );
 
@@ -493,12 +530,14 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
         /* surface wasn't used, it shouldn't be in any list */
         list_add_tail( &client_surfaces, &surface->entry );
         client_surface_update_locked( surface );
+        update_sibling_surfaces_locked( surface->hwnd, surface );
     }
     else
     {
         list_remove( &surface->entry ); /* remove it from client_surfaces, if it was used */
         list_add_head( &unused_surfaces, &surface->entry ); /* add it to the head, so we discard older ones */
         client_surface_add_ref( surface );
+        update_sibling_surfaces_locked( surface->hwnd, surface );
     }
 
     pthread_mutex_unlock( &surfaces_lock );
