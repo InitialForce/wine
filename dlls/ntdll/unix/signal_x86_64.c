@@ -1663,24 +1663,32 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
  *           special_apc_on_syscall_return
  *
  * Called by the syscall dispatcher when a signal came during the system call, which may be for a
- * special user APC. Runs the APC as the call returns, as Windows does. The signal handler sets
- * the control, segment and floating point flags when it writes back the frame, so those are no
- * reason to skip. A call that restores the integer registers or the extended state (NtContinue,
- * or a SetThreadContext during a suspend) resumes a full context, and the APC frame would lose
- * part of it: the APC then waits, and the wineserver signals again.
+ * special user APC. Runs the APC as the call returns, as Windows does. The APC gets the full
+ * context the call returns to, extended state included, so NtContinueEx restores all of it.
  */
 ULONG_PTR special_apc_on_syscall_return( ULONG_PTR ret )
 {
     struct thread_data *data = get_thread_data();
     struct syscall_frame *frame = get_syscall_frame( data );
+    struct xcontext context;
     struct user_apc apc;
 
     get_teb_data( data )->syscall_trace &= ~SYSCALL_SIGNALLED;
-    if (frame->restore_flags & (0x2 /* CONTEXT_INTEGER */ | 0x40 /* CONTEXT_XSTATE */ |
-                                RESTORE_FLAGS_INCOMPLETE_FRAME_CONTEXT)) return ret;
+    if (frame->restore_flags & RESTORE_FLAGS_INCOMPLETE_FRAME_CONTEXT) return ret;
     if (frame->cs != cs64_sel) return ret;
     if (!get_special_user_apc( &apc )) return ret;
-    return call_user_apc_dispatcher( NULL, apc.flags, apc.args[0], apc.args[1], apc.args[2],
+
+    context.c.ContextFlags = CONTEXT_FULL | CONTEXT_SEGMENTS;
+    NtGetContextThread( GetCurrentThread(), &context.c );
+    /* a call that restores the integer registers (NtContinue) returns with the context's rax */
+    if (!(frame->restore_flags & 0x2 /* CONTEXT_INTEGER */)) context.c.Rax = ret;
+    if (xstate_extended_features)
+    {
+        if (user_shared_data->XState.CompactionEnabled)
+            frame->xstate.CompactionMask |= xstate_extended_features;
+        context_init_xstate( &context.c, &frame->xstate );
+    }
+    return call_user_apc_dispatcher( &context.c, apc.flags, apc.args[0], apc.args[1], apc.args[2],
                                      wine_server_get_ptr( apc.func ), ret );
 }
 
