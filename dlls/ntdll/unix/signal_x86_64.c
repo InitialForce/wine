@@ -35,6 +35,10 @@
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <dlfcn.h>
+#ifdef __linux__
+#include <link.h>
+#endif
 #ifdef HAVE_LINK_H
 # include <link.h>
 #endif
@@ -536,6 +540,41 @@ static unsigned int frame_size;
 static unsigned int xstate_size = sizeof(XSAVE_AREA_HEADER);
 static UINT64 xstate_extended_features;
 static LONG syscall_dispatch_enabled = TRUE;
+
+/* executable range of ntdll.so; its syscall dispatchers run on the user stack */
+static ULONG_PTR unix_code_start, unix_code_end;
+
+static void init_unix_code_range(void)
+{
+#ifdef __linux__
+    Dl_info info;
+    const ElfW(Ehdr) *ehdr;
+    const ElfW(Phdr) *phdr;
+    ULONG_PTR base;
+    int i;
+
+    if (!dladdr( (void *)init_unix_code_range, &info ) || !info.dli_fbase) return;
+    ehdr = info.dli_fbase;
+    base = (ULONG_PTR)info.dli_fbase;
+    phdr = (const ElfW(Phdr) *)((const char *)ehdr + ehdr->e_phoff);
+    /* the first PT_LOAD of a shared object is mapped at dli_fbase */
+    for (i = 0; i < ehdr->e_phnum; i++)
+    {
+        if (phdr[i].p_type != PT_LOAD) continue;
+        base -= phdr[i].p_vaddr & ~(ElfW(Addr))(page_size - 1);
+        break;
+    }
+    for (i = 0; i < ehdr->e_phnum; i++)
+    {
+        ULONG_PTR start, end;
+        if (phdr[i].p_type != PT_LOAD || !(phdr[i].p_flags & PF_X)) continue;
+        start = base + phdr[i].p_vaddr;
+        end = start + phdr[i].p_memsz;
+        if (!unix_code_start || start < unix_code_start) unix_code_start = start;
+        if (end > unix_code_end) unix_code_end = end;
+    }
+#endif
+}
 
 static inline struct thread_data *get_current_thread_data(void)
 {
@@ -1600,6 +1639,9 @@ static BOOL setup_special_user_apc( struct thread_data *data, ucontext_t *sigcon
     void *callback;
 
     if (context->SegCs != cs64_sel) return FALSE;
+    /* the syscall dispatchers save and restore the syscall frame while on the user stack;
+     * leave the APC queued, and the wineserver signals again */
+    if (!unix_code_end || (context->Rip >= unix_code_start && context->Rip < unix_code_end)) return FALSE;
     if (!get_special_user_apc( &apc )) return FALSE;
 
     rsp = context->Rsp & ~(ULONG_PTR)15;
@@ -2884,6 +2926,7 @@ void signal_init_process( TEB *teb )
 
     if (user_shared_data->XState.Size) xstate_size = user_shared_data->XState.Size - sizeof(XSAVE_FORMAT);
     frame_size = offsetof( struct syscall_frame, xstate ) + xstate_size;
+    init_unix_code_range();
     xstate_extended_features = user_shared_data->XState.EnabledFeatures & ~(UINT64)3;
 
     /* sneak in a syscall dispatcher pointer at a fixed address (7ffe1000) */
