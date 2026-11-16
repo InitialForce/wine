@@ -1109,6 +1109,18 @@ static int wait_on_handles( const union select_op *select_op, unsigned int count
     return ret;
 }
 
+static inline int is_special_user_apc( const struct thread_apc *apc )
+{
+    return apc->call.type == APC_USER && (apc->call.user.flags & SERVER_USER_APC_SPECIAL);
+}
+
+/* special user APCs are queued before the other user APCs, so only the head needs checking */
+static int has_special_user_apc( struct thread *thread )
+{
+    struct list *ptr = list_head( &thread->user_apc );
+    return ptr && is_special_user_apc( LIST_ENTRY( ptr, struct thread_apc, entry ));
+}
+
 /* check if the thread waiting condition is satisfied */
 static int check_wait( struct thread *thread )
 {
@@ -1129,6 +1141,8 @@ static int check_wait( struct thread *thread )
 
     /* Suspended threads may not acquire locks, but they can run system APCs */
     if (is_thread_suspended( thread )) return -1;
+
+    if ((wait->flags & SELECT_SPECIAL_APC) && has_special_user_apc( thread )) return STATUS_USER_APC;
 
     if (wait->select == SELECT_WAIT_ALL)
     {
@@ -1426,12 +1440,28 @@ static int queue_apc( struct process *process, struct thread *thread, struct thr
         {
             if (!send_thread_signal( thread, SIGUSR1 )) return 0;
         }
+        /* interrupt a thread that runs code for a special user APC, as for a system APC */
+        if (is_special_user_apc( apc ) && !(thread->wait && (thread->wait->flags & SELECT_ALERTABLE)))
+            send_thread_signal( thread, SIGUSR1 );
         /* cancel a possible previous APC with the same owner */
         if (apc->owner) thread_cancel_apc( thread, apc->owner, apc->call.type );
     }
 
     grab_object( apc );
-    list_add_tail( queue, &apc->entry );
+    if (is_special_user_apc( apc ))
+    {
+        /* special user APCs run before the other user APCs, in the order they were queued */
+        struct list *pos = queue;
+        struct thread_apc *prev;
+
+        LIST_FOR_EACH_ENTRY( prev, queue, struct thread_apc, entry )
+        {
+            if (!is_special_user_apc( prev )) break;
+            pos = &prev->entry;
+        }
+        list_add_after( pos, &apc->entry );
+    }
+    else list_add_tail( queue, &apc->entry );
     if (!list_prev( queue, &apc->entry ))  /* first one */
     {
         if (apc->call.type == APC_USER && thread->alert_sync)

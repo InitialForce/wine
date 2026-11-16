@@ -1539,7 +1539,8 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
     ULONG64 rsp = context ? context->Rsp : frame->rsp;
     struct apc_stack_layout *stack;
 
-    if (flags & ~SERVER_USER_APC_CALLBACK_DATA_CONTEXT) FIXME( "flags %#x are not supported.\n", flags );
+    if (flags & ~(SERVER_USER_APC_CALLBACK_DATA_CONTEXT | SERVER_USER_APC_SPECIAL))
+        FIXME( "flags %#x are not supported.\n", flags );
 
     rsp &= ~15;
     stack = (struct apc_stack_layout *)rsp - 1;
@@ -1576,6 +1577,78 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
     frame->rip = (ULONG64)pKiUserApcDispatcher;
     frame->restore_flags |= CONTEXT_CONTROL;
     return status;
+}
+
+
+/***********************************************************************
+ *           setup_special_user_apc
+ *
+ * Run a special user APC on a thread that a signal interrupted in user code: the signal
+ * handler returns into KiUserApcDispatcher, and NtContinueEx then resumes the interrupted
+ * context. Returns FALSE when no special APC is queued or the stack has no room for the frame.
+ */
+static BOOL setup_special_user_apc( struct thread_data *data, ucontext_t *sigcontext,
+                                    struct xcontext *xcontext )
+{
+    CONTEXT *context = &xcontext->c;
+    XSAVE_AREA_HEADER *src_xs = xstate_from_context( context );
+    struct apc_stack_layout *stack;
+    struct user_apc apc;
+    ULONG_PTR rsp, frame;
+    void *callback;
+
+    if (context->SegCs != cs64_sel) return FALSE;
+
+    rsp = context->Rsp & ~(ULONG_PTR)15;
+    frame = src_xs ? ((rsp - xstate_size) & ~(ULONG_PTR)63) : rsp;
+    stack = (struct apc_stack_layout *)frame - 1;
+    if ((char *)stack < (char *)data->teb->Tib.StackLimit + 2 * get_host_page_size() ||
+        rsp > (ULONG_PTR)data->teb->Tib.StackBase)
+        return FALSE;
+
+    if (!get_special_user_apc( &apc )) return FALSE;
+
+    stack->context = *context;
+    stack->context.ContextFlags = CONTEXT_FULL;
+    if (src_xs)
+    {
+        XSAVE_AREA_HEADER *dst_xs = (XSAVE_AREA_HEADER *)frame;
+        context_init_xstate( &stack->context, dst_xs );
+        memset( dst_xs, 0, sizeof(*dst_xs) );
+        dst_xs->CompactionMask = user_shared_data->XState.CompactionEnabled ? 0x8000000000000000 | xstate_extended_features : 0;
+        copy_xstate( dst_xs, src_xs, src_xs->Mask );
+    }
+    else context_init_xstate( &stack->context, NULL );
+
+    memset( &stack->continue_arg, 0, sizeof(stack->continue_arg) );
+    stack->continue_arg.ContinueType = KCONTINUE_RESUME;
+    stack->context.P1Home = apc.args[0];
+    if (apc.flags & SERVER_USER_APC_CALLBACK_DATA_CONTEXT)
+    {
+        stack->callback_data.ContextRecord = &stack->context;
+        stack->callback_data.Parameter = apc.args[1];
+        stack->callback_data.Reserved0 = 0;
+        stack->callback_data.Reserved1 = 0;
+        stack->context.P2Home = (ULONG_PTR)&stack->callback_data;
+    }
+    else stack->context.P2Home = apc.args[1];
+    stack->context.P3Home = apc.args[2];
+    stack->context.P4Home = (ULONG64)wine_server_get_ptr( apc.func );
+    stack->machine_frame.rip = context->Rip;
+    stack->machine_frame.rsp = context->Rsp;
+
+    CS_sig(sigcontext)  = cs64_sel;
+    RIP_sig(sigcontext) = (ULONG_PTR)pKiUserApcDispatcher;
+    RSP_sig(sigcontext) = (ULONG_PTR)stack;
+    /* clear single-step, direction, and align check flag */
+    EFL_sig(sigcontext) &= ~(0x100|0x400|0x40000);
+    if ((callback = instrumentation_callback))
+    {
+        R10_sig(sigcontext) = RIP_sig(sigcontext);
+        RIP_sig(sigcontext) = (ULONG64)callback;
+    }
+    leave_handler( data, sigcontext );
+    return TRUE;
 }
 
 
@@ -2605,7 +2678,8 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         context.c.ContextFlags |= CONTEXT_EXCEPTION_REPORTING;
         if (is_wow64() && context.c.SegCs == cs64_sel) context.c.ContextFlags |= CONTEXT_EXCEPTION_ACTIVE;
         wait_suspend( &context.c );
-        restore_context( data, &context, sigcontext );
+        if (!setup_special_user_apc( data, sigcontext, &context ))
+            restore_context( data, &context, sigcontext );
     }
 }
 

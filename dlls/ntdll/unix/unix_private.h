@@ -295,6 +295,7 @@ extern void DECLSPEC_NORETURN abort_thread( int status );
 extern void DECLSPEC_NORETURN abort_process( int status );
 extern void DECLSPEC_NORETURN exit_process( int status );
 extern void wait_suspend( CONTEXT *context );
+extern BOOL get_special_user_apc( struct user_apc *apc );
 extern NTSTATUS send_debug_event( struct thread_data *data, EXCEPTION_RECORD *rec,
                                   CONTEXT *context, BOOL first_chance );
 extern NTSTATUS set_thread_context( HANDLE handle, const void *context, BOOL *self, USHORT machine );
