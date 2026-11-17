@@ -1568,6 +1568,18 @@ static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcont
 
 
 /***********************************************************************
+ *           exception_frame
+ *
+ * Where call_user_exception_dispatcher() puts the exception frame below rsp, extended state
+ * included.
+ */
+static struct exc_stack_layout *exception_frame( ULONG64 rsp )
+{
+    return (struct exc_stack_layout *)((rsp - sizeof(struct exc_stack_layout) - xstate_size) & ~(ULONG64)63);
+}
+
+
+/***********************************************************************
  *           call_user_apc_dispatcher
  */
 NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3,
@@ -1629,8 +1641,8 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
         }
         rec.ExceptionAddress = (void *)context->Rip;
         /* the exception frame is larger; this ends the thread if it reaches the last page */
-        virtual_setup_user_frame( data, (void *)(context->Rsp & ~(ULONG_PTR)15),
-                                  sizeof(struct exc_stack_layout) + xstate_size + 64 );
+        virtual_setup_user_frame( data, (void *)context->Rsp,
+                                  context->Rsp - (ULONG_PTR)exception_frame( context->Rsp ) );
         WARN_(seh)( "stack overflow delivering a user APC, rsp %#lx\n", (ULONG_PTR)frame_top );
         return NtRaiseException( &rec, context, TRUE );
     }
@@ -1818,7 +1830,7 @@ NTSTATUS call_user_exception_dispatcher( struct thread_data *data, EXCEPTION_REC
     NTSTATUS status = NtSetContextThread( GetCurrentThread(), context );
 
     if (status) return status;
-    stack = (struct exc_stack_layout *)((context->Rsp - sizeof(*stack) - xstate_size) & ~(ULONG_PTR)63);
+    stack = exception_frame( context->Rsp );
     memmove( &stack->context, context, sizeof(*context) );
 
     /* the copy may have overwritten the context, read the flags from the copy */
