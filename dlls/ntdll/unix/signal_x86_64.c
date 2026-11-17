@@ -1628,6 +1628,9 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
             context->Rax = status;
         }
         rec.ExceptionAddress = (void *)context->Rip;
+        /* the exception frame is larger; this ends the thread if it reaches the last page */
+        virtual_setup_user_frame( data, (void *)(context->Rsp & ~(ULONG_PTR)15),
+                                  sizeof(struct exc_stack_layout) + xstate_size + 64 );
         WARN_(seh)( "stack overflow delivering a user APC, rsp %#lx\n", (ULONG_PTR)frame_top );
         return NtRaiseException( &rec, context, TRUE );
     }
@@ -1818,7 +1821,8 @@ NTSTATUS call_user_exception_dispatcher( struct thread_data *data, EXCEPTION_REC
     stack = (struct exc_stack_layout *)((context->Rsp - sizeof(*stack) - xstate_size) & ~(ULONG_PTR)63);
     memmove( &stack->context, context, sizeof(*context) );
 
-    if ((context->ContextFlags & CONTEXT_XSTATE) == CONTEXT_XSTATE)
+    /* the copy may have overwritten the context, read the flags from the copy */
+    if ((stack->context.ContextFlags & CONTEXT_XSTATE) == CONTEXT_XSTATE)
     {
         XSAVE_AREA_HEADER *dst_xs = (XSAVE_AREA_HEADER *)(stack + 1);
         assert( !((ULONG_PTR)dst_xs & 63) );
