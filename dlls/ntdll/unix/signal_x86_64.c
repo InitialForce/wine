@@ -1615,8 +1615,21 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
     /* commit the stack pages for the frame first, as for an exception */
     if (virtual_setup_user_frame( data, (void *)frame_top, frame_top - (ULONG64)stack ))
     {
-        ERR_(seh)( "stack overflow delivering a user APC, rsp %#lx\n", (ULONG_PTR)frame_top );
-        abort_thread( 1 );
+        /* The frame reaches the guaranteed stack space: raise the stack overflow at the
+         * thread's context instead, and drop the APC. Nothing is written yet, so the
+         * context and its extended state are still intact. */
+        EXCEPTION_RECORD rec = { STATUS_STACK_OVERFLOW };
+
+        if (!context)
+        {
+            context = &saved;
+            context->ContextFlags = CONTEXT_FULL;
+            NtGetContextThread( GetCurrentThread(), context );
+            context->Rax = status;
+        }
+        rec.ExceptionAddress = (void *)context->Rip;
+        WARN_(seh)( "stack overflow delivering a user APC, rsp %#lx\n", (ULONG_PTR)frame_top );
+        return NtRaiseException( &rec, context, TRUE );
     }
     if (context)
     {
