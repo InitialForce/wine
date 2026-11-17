@@ -1575,7 +1575,7 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
 {
     struct thread_data *data = get_thread_data();
     struct syscall_frame *frame = get_syscall_frame( data );
-    ULONG64 rsp = context ? context->Rsp : frame->rsp;
+    ULONG64 rsp = context ? context->Rsp : frame->rsp, frame_top;
     /* the largest state Wine enables (AVX-512) takes under 0xa00 bytes after the legacy area */
     char xs_buf[0x1000] DECLSPEC_ALIGN(64);
     XSAVE_AREA_HEADER *saved_xs = NULL;
@@ -1609,8 +1609,15 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
         }
     }
     rsp &= ~15;
+    frame_top = rsp;
     if (saved_xs) rsp = (rsp - xstate_size) & ~(ULONG64)63;
     stack = (struct apc_stack_layout *)rsp - 1;
+    /* commit the stack pages for the frame first, as for an exception */
+    if (virtual_setup_user_frame( data, (void *)frame_top, frame_top - (ULONG64)stack ))
+    {
+        ERR_(seh)( "stack overflow delivering a user APC, rsp %#lx\n", (ULONG_PTR)frame_top );
+        abort_thread( 1 );
+    }
     if (context)
     {
         stack->context = saved;

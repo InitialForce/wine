@@ -4799,6 +4799,50 @@ void *virtual_setup_exception( struct thread_data *data, void *stack_ptr, size_t
 
 
 /***********************************************************************
+ *           virtual_setup_user_frame
+ *
+ * Commit the thread stack pages that a frame of the given size below stack_ptr needs, outside
+ * a signal handler. Returns STATUS_STACK_OVERFLOW when the frame would reach the last stack
+ * page, which is never committed. A stack_ptr outside the thread stack (a fiber stack, for
+ * example) is left to the caller, as for an exception.
+ */
+NTSTATUS virtual_setup_user_frame( struct thread_data *data, void *stack_ptr, size_t size )
+{
+    struct thread_stack_info stack_info;
+    char *stack = stack_ptr;
+    sigset_t sigset;
+
+    if (!is_inside_thread_stack( data, stack, &stack_info )) return STATUS_SUCCESS;
+
+    stack -= size;
+    if (stack < stack_info.start + host_page_size)
+    {
+        ERR( "no room for a frame of %#zx bytes at %p (%p-%p-%p)\n",
+             size, stack_ptr, stack_info.start, stack_info.limit, stack_info.end );
+        return STATUS_STACK_OVERFLOW;
+    }
+    if (stack >= stack_info.limit) return STATUS_SUCCESS;
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    while (stack < stack_info.limit)
+    {
+        char *page = stack_info.limit - host_page_size;
+
+        if (!(get_host_page_vprot( page ) & VPROT_GUARD)) break;
+        if (grow_thread_stack( data, page, &stack_info ))
+        {
+            /* grow_thread_stack committed the guaranteed space, which reaches the frame */
+            WARN( "frame at %p uses the guaranteed stack space\n", stack );
+            break;
+        }
+        stack_info.limit = page;
+    }
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    return STATUS_SUCCESS;
+}
+
+
+/***********************************************************************
  *           check_write_access
  *
  * Check if the memory range is writable, temporarily disabling write watches if necessary.
