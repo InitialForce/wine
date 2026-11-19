@@ -4608,6 +4608,7 @@ MINMAXINFO get_min_max_info( HWND hwnd )
     DWORD adjusted_style;
     MINMAXINFO minmax;
     INT xinc, yinc;
+    POINT sent_pos;
     RECT rc;
     WND *win;
 
@@ -4653,6 +4654,7 @@ MINMAXINFO get_min_max_info( HWND hwnd )
         release_win_ptr( win );
     }
 
+    sent_pos = minmax.ptMaxPosition;
     send_message( hwnd, WM_GETMINMAXINFO, 0, (LPARAM)&minmax );
 
     /* if the app didn't change the values, adapt them for the current monitor */
@@ -4660,6 +4662,14 @@ MINMAXINFO get_min_max_info( HWND hwnd )
     if (get_maximized_rect( hwnd, &rc_max ))
     {
         rc_primary = get_primary_monitor_rect( get_thread_dpi() );
+        /* A position the app set describes the primary monitor, like on Windows; move it to the
+         * monitor the window maximizes on. */
+        if (!(style & WS_CHILD) && (minmax.ptMaxPosition.x != sent_pos.x || minmax.ptMaxPosition.y != sent_pos.y))
+        {
+            MONITORINFO mon_info = monitor_info_from_window( hwnd, MONITOR_DEFAULTTOPRIMARY );
+            minmax.ptMaxPosition.x += mon_info.rcMonitor.left - rc_primary.left;
+            minmax.ptMaxPosition.y += mon_info.rcMonitor.top - rc_primary.top;
+        }
         if (minmax.ptMaxSize.x == (rc_primary.right - rc_primary.left) + 2 * xinc &&
             minmax.ptMaxSize.y == (rc_primary.bottom - rc_primary.top) + 2 * yinc)
         {
