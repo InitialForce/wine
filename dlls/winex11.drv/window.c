@@ -1498,7 +1498,8 @@ static void update_net_wm_states( struct x11drv_win_data *data )
     if (style & WS_MINIMIZE) new_state |= data->desired_state.net_wm_state & fullscreen_mask;
     if (data->is_fullscreen)
     {
-        if ((style & WS_MAXIMIZE) && (style & WS_CAPTION) == WS_CAPTION)
+        /* a resizable maximized window is maximized, not fullscreen, so the WM fits it to the work area */
+        if ((style & WS_MAXIMIZE) && ((style & WS_CAPTION) == WS_CAPTION || (style & WS_THICKFRAME)))
             new_state |= (1 << NET_WM_STATE_MAXIMIZED);
         else if (!(style & WS_MINIMIZE))
             new_state |= (1 << NET_WM_STATE_FULLSCREEN);
@@ -1767,7 +1768,7 @@ static UINT window_update_client_config( struct x11drv_win_data *data )
      * rect. If the application sets a visible rect slightly larger than the monitor rect and insists
      * on changing to the rect that it previously set when the rect is changed by the WM, then the
      * window rect will be repeatedly changed by the WM and the application, causing a flickering effect */
-    if (data->is_fullscreen)
+    if (data->is_fullscreen && (data->current_state.net_wm_state & (1 << NET_WM_STATE_FULLSCREEN)))
     {
         if (xinerama_get_fullscreen_monitors( &data->rects.visible, &old_generation, old_monitors )
             && xinerama_get_fullscreen_monitors( &data->current_state.rect, &generation, monitors )
