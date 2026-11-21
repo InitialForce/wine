@@ -292,6 +292,45 @@ void *free_user_handle( HANDLE handle, unsigned short type )
 }
 
 static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Rects of the offscreen client surfaces of toplevel windows, read by window_surface_flush.
+ * offscreen_lock is a leaf lock: window surface flushes run under other locks that
+ * client_surface_present takes while holding surfaces_lock, so flushes must not take surfaces_lock. */
+struct offscreen_rect
+{
+    struct list            entry;
+    struct client_surface *surface;
+    HWND                   hwnd;
+    RECT                   rect;
+};
+static pthread_mutex_t offscreen_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct list offscreen_rects = LIST_INIT( offscreen_rects );
+
+static void set_offscreen_rect( struct client_surface *surface, BOOL offscreen )
+{
+    struct offscreen_rect *entry, *found = NULL;
+
+    pthread_mutex_lock( &offscreen_lock );
+    LIST_FOR_EACH_ENTRY( entry, &offscreen_rects, struct offscreen_rect, entry )
+        if (entry->surface == surface) { found = entry; break; }
+    if (!offscreen)
+    {
+        if (found)
+        {
+            list_remove( &found->entry );
+            free( found );
+        }
+    }
+    else if (found || (found = calloc( 1, sizeof(*found) )))
+    {
+        if (!found->surface) list_add_tail( &offscreen_rects, &found->entry );
+        found->surface = surface;
+        found->hwnd = surface->hwnd;
+        found->rect = surface->monitor_rect;
+    }
+    pthread_mutex_unlock( &offscreen_lock );
+}
+
 static struct list client_surfaces = LIST_INIT( client_surfaces ); /* non-owning used client surfaces */
 static struct list unused_surfaces = LIST_INIT( unused_surfaces ); /* owning unused client surfaces */
 
@@ -305,6 +344,7 @@ static void client_surface_detach_locked( struct client_surface *surface )
 
     list_remove( &surface->entry );
     list_init( &surface->entry );
+    set_offscreen_rect( surface, FALSE );
     surface->funcs->detach( surface );
     surface->toplevel = NULL;
     surface->hwnd = NULL;
@@ -363,8 +403,22 @@ static RECT get_client_surface_rects( HWND toplevel, HWND hwnd, RECT *monitor_re
     return rect;
 }
 
+/* whether the client area of a window's toplevel crosses a monitor edge */
+static BOOL client_surface_spans_monitors( HWND hwnd )
+{
+    struct ratio dpi = get_thread_dpi();
+    HWND toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
+    struct window_rects rects;
+
+    if (!toplevel || !get_window_rects( toplevel, COORDS_SCREEN, &rects, dpi )) return FALSE;
+    if (IsRectEmpty( &rects.client )) return FALSE;
+    return rect_spans_monitors( rects.client, dpi );
+}
+
 /* whether another used surface draws into the same window, as when D3D9 makes one swap chain
- * per monitor for a window that spans monitors */
+ * per monitor for a window that spans monitors. WPF also keeps a 1x1 swap chain on every
+ * window it renders, so a second surface alone does not mean that: a window on one monitor
+ * keeps its surface onscreen, where the last present stays visible. */
 static BOOL is_client_surface_shared_locked( const struct client_surface *surface )
 {
     const struct client_surface *other;
@@ -372,6 +426,7 @@ static BOOL is_client_surface_shared_locked( const struct client_surface *surfac
     UINT count = 0;
 
     if (!surface->hwnd) return FALSE;
+    if (!client_surface_spans_monitors( surface->hwnd )) return FALSE;
     LIST_FOR_EACH_ENTRY( other, &client_surfaces, struct client_surface, entry )
     {
         if (other->hwnd != surface->hwnd) continue;
@@ -397,6 +452,7 @@ static void client_surface_update_locked( struct client_surface *surface )
 {
     RECT virtual_rect = surface->virtual_rect, monitor_rect = surface->monitor_rect;
     HWND toplevel = surface->toplevel;
+    BOOL offscreen = surface->offscreen;
 
     surface->shared = is_client_surface_shared_locked( surface );
     surface->toplevel = NtUserGetAncestor( surface->hwnd, GA_ROOT );
@@ -409,6 +465,12 @@ static void client_surface_update_locked( struct client_surface *surface )
     surface->updated = surface->updated || surface->toplevel != toplevel ||
                        !EqualRect( &surface->virtual_rect, &virtual_rect ) ||
                        !EqualRect( &surface->monitor_rect, &monitor_rect );
+    set_offscreen_rect( surface, surface->offscreen && surface->hwnd == surface->toplevel );
+
+    /* the frames presented offscreen do not carry over to the client window, which shows the
+     * window surface until the application presents again, so ask it to repaint */
+    if (offscreen && !surface->offscreen)
+        NtUserRedrawWindow( surface->hwnd, NULL, 0, RDW_INVALIDATE | RDW_ALLCHILDREN );
 }
 
 void update_client_surfaces( HWND hwnd )
@@ -478,6 +540,39 @@ void client_surface_present( struct client_surface *surface )
         if (hdc) NtUserReleaseDC( hwnd, hdc );
     }
     pthread_mutex_unlock( &surfaces_lock );
+}
+
+/* the part of a toplevel window's surface that its own offscreen client surfaces draw, in surface
+ * coordinates. Those surfaces present straight to the host window, so the window surface must not
+ * be flushed over them: GDI never paints there, and a flush after the last present would cover
+ * the frame with the surface's initial white until the next present. */
+HRGN get_offscreen_client_region( HWND hwnd, const RECT *surface_rect )
+{
+    struct offscreen_rect *entry;
+    HRGN region = 0, rect_region;
+    RECT rects[8], rect;
+    UINT i, count = 0;
+
+    pthread_mutex_lock( &offscreen_lock );
+    LIST_FOR_EACH_ENTRY( entry, &offscreen_rects, struct offscreen_rect, entry )
+        if (entry->hwnd == hwnd && count < ARRAY_SIZE(rects)) rects[count++] = entry->rect;
+    pthread_mutex_unlock( &offscreen_lock );
+
+    for (i = 0; i < count; i++)
+    {
+        rect = rects[i];
+        OffsetRect( &rect, -surface_rect->left, -surface_rect->top );
+        if (IsRectEmpty( &rect )) continue;
+        if (!(rect_region = NtGdiCreateRectRgn( rect.left, rect.top, rect.right, rect.bottom ))) continue;
+        if (!region) region = rect_region;
+        else
+        {
+            NtGdiCombineRgn( region, region, rect_region, RGN_OR );
+            NtGdiDeleteObjectApp( rect_region );
+        }
+    }
+
+    return region;
 }
 
 void client_surface_update( struct client_surface *surface )
@@ -2543,6 +2638,7 @@ static BOOL expose_window_surface( HWND hwnd, UINT flags, const RECT *rect )
     struct window_surface *surface;
     struct window_rects rects;
     RECT exposed_rect;
+    HRGN region;
     WND *win;
 
     if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
@@ -2574,6 +2670,13 @@ static BOOL expose_window_surface( HWND hwnd, UINT flags, const RECT *rect )
     }
     window_surface_unlock( surface );
     window_surface_flush( surface );
+
+    /* frames presented offscreen before the window was viewable were dropped by the host */
+    if ((region = get_offscreen_client_region( hwnd, &surface->rect )))
+    {
+        NtGdiDeleteObjectApp( region );
+        NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ALLCHILDREN );
+    }
     window_surface_release( surface );
     return TRUE;
 }

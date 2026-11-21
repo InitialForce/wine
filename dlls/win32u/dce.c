@@ -619,7 +619,10 @@ void window_surface_flush( struct window_surface *surface )
     char shape_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
     BITMAPINFO *color_info = (BITMAPINFO *)color_buf;
     BITMAPINFO *shape_info = (BITMAPINFO *)shape_buf;
-    RECT dirty = surface->rect, bounds;
+    RECT dirty = surface->rect, bounds, *rects = &dirty;
+    RGNDATA *data = NULL;
+    HRGN client_region = 0, dirty_region;
+    UINT i, count = 1;
     void *color_bits;
 
     window_surface_lock( surface );
@@ -631,21 +634,55 @@ void window_surface_flush( struct window_surface *surface )
     bounds.bottom = surface->bounds.bottom;
 
     OffsetRect( &dirty, -dirty.left, -dirty.top );
+    if (!intersect_rect( &dirty, &dirty, &bounds )) goto done;
 
-    if (intersect_rect( &dirty, &dirty, &bounds ) && (color_bits = window_surface_get_color( surface, color_info )))
+    /* the window surface is not flushed over offscreen client surfaces, see get_offscreen_client_region */
+    if (surface->hwnd && surface->funcs != &scaled_surface_funcs && surface->alpha_bits == -1 &&
+        surface->color_key == CLR_INVALID &&
+        (client_region = get_offscreen_client_region( surface->hwnd, &surface->rect )) &&
+        (dirty_region = NtGdiCreateRectRgn( dirty.left, dirty.top, dirty.right, dirty.bottom )))
+    {
+        DWORD size;
+
+        if (NtGdiCombineRgn( dirty_region, dirty_region, client_region, RGN_DIFF ) == NULLREGION) count = 0;
+        else if ((size = NtGdiGetRegionData( dirty_region, 0, NULL )) && (data = malloc( size )) &&
+                 NtGdiGetRegionData( dirty_region, size, data ))
+        {
+            rects = (RECT *)data->Buffer;
+            count = data->rdh.nCount;
+        }
+        NtGdiDeleteObjectApp( dirty_region );
+    }
+
+    if ((color_bits = window_surface_get_color( surface, color_info )))
     {
         BOOL shape_changed = update_surface_shape( surface, &surface->rect, &dirty, color_info, color_bits );
         void *shape_bits = window_surface_get_shape( surface, shape_info );
+        BOOL flushed = TRUE;
+        RECT empty = {0};
 
-        TRACE( "Flushing hwnd %p, surface %p %s, bounds %s, dirty %s\n", surface->hwnd, surface,
-               wine_dbgstr_rect( &surface->rect ), wine_dbgstr_rect( &surface->bounds ), wine_dbgstr_rect( &dirty ) );
+        TRACE( "Flushing hwnd %p, surface %p %s, bounds %s, dirty %s, %u rects\n", surface->hwnd, surface,
+               wine_dbgstr_rect( &surface->rect ), wine_dbgstr_rect( &surface->bounds ), wine_dbgstr_rect( &dirty ), count );
 
-        if (surface->funcs->flush( surface, &surface->rect, &dirty, color_info, color_bits,
-                                   shape_changed, shape_info, shape_bits ))
-            reset_bounds( &surface->bounds );
+        /* a new shape is only sent with a flush */
+        if (!count && shape_changed)
+            flushed = surface->funcs->flush( surface, &surface->rect, &empty, color_info, color_bits,
+                                             shape_changed, shape_info, shape_bits );
+        for (i = 0; i < count; i++)
+        {
+            if (!surface->funcs->flush( surface, &surface->rect, &rects[i], color_info, color_bits,
+                                        shape_changed, shape_info, shape_bits ))
+                flushed = FALSE;
+            shape_changed = FALSE;
+        }
+        if (flushed) reset_bounds( &surface->bounds );
     }
 
+done:
     window_surface_unlock( surface );
+
+    if (client_region) NtGdiDeleteObjectApp( client_region );
+    free( data );
 }
 
 void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask )

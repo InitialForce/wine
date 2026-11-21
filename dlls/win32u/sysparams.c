@@ -4800,6 +4800,25 @@ static HMONITOR monitor_from_rect( const RECT *rect, UINT flags, struct ratio dp
     return ret;
 }
 
+/* whether a rect intersects more than one monitor */
+BOOL rect_spans_monitors( RECT rect, struct ratio dpi )
+{
+    struct monitor *monitor;
+    RECT monitor_rect, intersect;
+    UINT count = 0;
+
+    if (!lock_display_devices( FALSE )) return FALSE;
+    LIST_FOR_EACH_ENTRY( monitor, &monitors, struct monitor, entry )
+    {
+        if (!is_monitor_active( monitor ) || monitor->is_clone) continue;
+        monitor_rect = monitor_get_rect( monitor, dpi, MDT_DEFAULT );
+        if (intersect_rect( &intersect, &monitor_rect, &rect ) && ++count > 1) break;
+    }
+    unlock_display_devices();
+
+    return count > 1;
+}
+
 MONITORINFO monitor_info_from_rect( RECT rect, struct ratio dpi )
 {
     MONITORINFO info = {.cbSize = sizeof(info)};
