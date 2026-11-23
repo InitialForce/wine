@@ -550,12 +550,19 @@ HRGN get_offscreen_client_region( HWND hwnd, const RECT *surface_rect )
 {
     struct offscreen_rect *entry;
     HRGN region = 0, rect_region;
-    RECT rects[8], rect;
-    UINT i, count = 0;
+    RECT buffer[8], *rects = buffer, rect;
+    UINT i, count = 0, size = 0;
 
     pthread_mutex_lock( &offscreen_lock );
     LIST_FOR_EACH_ENTRY( entry, &offscreen_rects, struct offscreen_rect, entry )
-        if (entry->hwnd == hwnd && count < ARRAY_SIZE(rects)) rects[count++] = entry->rect;
+        if (entry->hwnd == hwnd) size++;
+    if (size > ARRAY_SIZE(buffer) && !(rects = malloc( size * sizeof(*rects) )))
+    {
+        rects = buffer;
+        size = ARRAY_SIZE(buffer);
+    }
+    LIST_FOR_EACH_ENTRY( entry, &offscreen_rects, struct offscreen_rect, entry )
+        if (entry->hwnd == hwnd && count < size) rects[count++] = entry->rect;
     pthread_mutex_unlock( &offscreen_lock );
 
     for (i = 0; i < count; i++)
@@ -572,6 +579,7 @@ HRGN get_offscreen_client_region( HWND hwnd, const RECT *surface_rect )
         }
     }
 
+    if (rects != buffer) free( rects );
     return region;
 }
 
