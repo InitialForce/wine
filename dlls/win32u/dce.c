@@ -556,6 +556,7 @@ struct window_surface *window_surface_create( const struct window_surface_funcs 
                                               const RECT *rect, BITMAPINFO *info, HBITMAP bitmap )
 {
     struct window_surface *surface;
+    HBRUSH brush;
 
     if (!(surface = calloc( 1, funcs->size ))) return NULL;
     surface->funcs = funcs;
@@ -576,7 +577,19 @@ struct window_surface *window_surface_create( const struct window_surface_funcs 
 
     pthread_mutex_init( &surface->mutex, NULL );
 
-    memset( window_surface_get_color( surface, info ), 0xff, info->bmiHeader.biSizeImage );
+    /* a window whose class has no background brush shows opaque black until it paints, as on a
+     * composited desktop on Windows, rather than the white of an erased background */
+    if (hwnd && ((brush = (HBRUSH)get_class_long_ptr( hwnd, GCLP_HBRBACKGROUND, FALSE )) == 0 ||
+                 brush == GetStockObject( NULL_BRUSH )))
+    {
+        DWORD *color = window_surface_get_color( surface, info ), i;
+        if (info->bmiHeader.biBitCount == 32)
+            for (i = 0; i < info->bmiHeader.biSizeImage / sizeof(*color); i++) color[i] = 0xff000000;
+        else
+            memset( color, 0, info->bmiHeader.biSizeImage );
+    }
+    else
+        memset( window_surface_get_color( surface, info ), 0xff, info->bmiHeader.biSizeImage );
 
     TRACE( "created surface %p for hwnd %p rect %s\n", surface, hwnd, wine_dbgstr_rect( &surface->rect ) );
     return surface;
