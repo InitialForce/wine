@@ -1993,6 +1993,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     VkSwapchainKHR swapchains_buffer[16], *swapchains = swapchains_buffer;
     struct vulkan_device *device = queue->device;
     const VkSwapchainKHR *client_swapchains;
+    BOOL queue_idle = FALSE;
     VkResult res;
 
     TRACE( "queue %p, present_info %p\n", queue, present_info );
@@ -2033,6 +2034,16 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         struct surface *surface = swapchain->surface;
         RECT client_rect;
 
+        /* an offscreen surface is copied to its window from the host window the image was
+         * presented to. Wait for the queue so the copy does not run while the presentation is
+         * still in flight: a static window presents once, and an early copy would stay black.
+         * This narrows the race rather than closing it, as the presentation engine may finish
+         * after the queue, but it is enough on the drivers tested. */
+        if (swapchain_res >= VK_SUCCESS && surface->client->offscreen && !queue_idle)
+        {
+            device->p_vkQueueWaitIdle( queue->host.queue );
+            queue_idle = TRUE;
+        }
         client_surface_present( surface->client );
 
         if (swapchain_res < VK_SUCCESS) continue;
